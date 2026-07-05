@@ -1,0 +1,1383 @@
+#!/usr/bin/env bash
+# NOTE: `set -euo pipefail` and the EXIT trap are deliberately NOT set at the top
+# level — they are enabled inside main() instead. When this script is *sourced*
+# (e.g. `. ~/claude-account-switch.sh`), top-level shell-option changes and traps
+# would leak into the caller's interactive shell, and a later `exit` would kill it.
+# See the sourced-safe launcher at the bottom of the file.
+
+PROFILE_ROOT="${HOME}/.claude-profiles"
+ACTIVE_PROFILE_FILE="${PROFILE_ROOT}/.active_profile"
+CLAUDE_DIR="${HOME}/.claude"
+CLAUDE_CONFIG="${HOME}/.claude.json"
+RAW_MODE_ENABLED=false
+ALT_SCREEN_ACTIVE=false
+
+# Marker glyphs (single-column unicode — safe on any modern terminal).
+GLYPH_ACTIVE='●'
+GLYPH_POINTER='➜'
+GLYPH_DOT='·'
+
+# Parallel arrays describing the profiles shown in the menu. Populated ONCE per
+# menu session by build_profile_meta so rendering never shells out per keypress.
+PROFILES=()
+P_EMAIL=()
+P_ORG=()
+P_SUB=()
+P_U5=()   # cached 5h utilization %  (empty = none)
+P_U7=()   # cached 7d utilization %
+P_UTS=()  # epoch the cache was written
+
+cleanup() {
+  disable_raw_mode
+  leave_alt_screen
+}
+
+# ── Terminal primitives ─────────────────────────────────────────────────────
+hide_cursor() { printf '\033[?25l'; }
+show_cursor() { printf '\033[?25h'; }
+enter_alt_screen() {
+  printf '\033[?1049h'
+  ALT_SCREEN_ACTIVE=true
+}
+
+# Idempotent: only the first leave emits the escape. A second `\033[?1049l` after
+# we've already switched to the primary buffer and printed there would re-restore
+# the cursor to its pre-alt-screen position, stranding our output below the prompt.
+leave_alt_screen() {
+  [[ "$ALT_SCREEN_ACTIVE" == true ]] || return 0
+  show_cursor
+  printf '\033[?1049l'
+  ALT_SCREEN_ACTIVE=false
+}
+
+clear_screen() { printf '\033[2J\033[H'; }
+
+enable_raw_mode() {
+  if [[ -t 0 ]] && [[ -r /dev/tty ]]; then
+    stty -echo -icanon -icrnl < /dev/tty 2>/dev/null || true
+    RAW_MODE_ENABLED=true
+  fi
+}
+
+disable_raw_mode() {
+  if [[ "$RAW_MODE_ENABLED" == true ]]; then
+    stty sane < /dev/tty 2>/dev/null || true
+    RAW_MODE_ENABLED=false
+  fi
+}
+
+quit_program() {
+  disable_raw_mode
+  leave_alt_screen
+  printf 'Bye.\n'
+  exit 0
+}
+
+# ── Colour palette (accent-forward, degrades to bold/reverse under NO_COLOR) ──
+init_colors() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RESET=$'\033[0m'
+    C_DIM=$'\033[2m'
+    C_BOLD=$'\033[1m'
+    C_ACCENT=$'\033[38;5;39m'    # bright blue
+    C_TITLE=$'\033[1m\033[38;5;39m'
+    C_MUTED=$'\033[38;5;245m'
+    C_RULE=$'\033[38;5;238m'
+    C_ACTIVE=$'\033[38;5;42m'    # green dot for the live profile
+    C_SEL=$'\033[1m\033[38;5;231m\033[48;5;24m'  # bold near-white on dark cyan
+    C_GREEN=$'\033[38;5;42m'
+    C_AMBER=$'\033[38;5;214m'
+    C_RED=$'\033[38;5;203m'
+    C_KEY=$'\033[1m\033[38;5;39m'
+  else
+    C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+    C_ACCENT=''; C_TITLE=$'\033[1m'; C_MUTED=$'\033[2m'; C_RULE=''
+    C_ACTIVE=$'\033[1m'; C_SEL=$'\033[7m'
+    C_GREEN=''; C_AMBER=''; C_RED=''; C_KEY=$'\033[1m'
+  fi
+}
+
+# ── Small text helpers (operate on PLAIN text; width math assumes UTF-8) ──────
+term_cols() {
+  local c
+  c="$(tput cols 2>/dev/null || echo 80)"
+  [[ "$c" =~ ^[0-9]+$ ]] || c=80
+  printf '%s' "$c"
+}
+
+# Truncate plain text to at most $1 columns, adding an ellipsis when cut.
+trunc() {
+  local w="$1" s="$2"
+  if (( ${#s} > w )); then
+    if (( w >= 1 )); then printf '%s…' "${s:0:w-1}"; fi
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# Pad (or truncate) plain text to exactly $1 columns.
+pad_to() {
+  local w="$1" s
+  s="$(trunc "$1" "$2")"
+  printf '%s%*s' "$s" $(( w - ${#s} )) ''
+}
+
+# Colour for a utilization percentage: low=green, mid=amber, high=red.
+sem_color() {
+  local p="$1"
+  if (( p >= 80 )); then printf '%s' "$C_RED"
+  elif (( p >= 50 )); then printf '%s' "$C_AMBER"
+  else printf '%s' "$C_GREEN"; fi
+}
+
+# A compact filled/empty bar for a percentage.
+render_bar() {
+  local pct="$1" cells="${2:-4}" col="$3"
+  local filled=$(( (pct * cells + 50) / 100 ))
+  (( filled > cells )) && filled=cells
+  (( filled < 0 )) && filled=0
+  local i s=""
+  for (( i = 0; i < filled; i++ )); do s+="█"; done
+  for (( i = filled; i < cells; i++ )); do s+="░"; done
+  printf '%s%s%s' "$col" "$s" "$C_RESET"
+}
+
+# Same bar as render_bar but with NO escape sequences — safe to embed in the plain
+# row body (which is displayed verbatim, under reverse video, on the selected row).
+bar_plain() {
+  local pct="$1" cells="${2:-4}"
+  local filled=$(( (pct * cells + 50) / 100 ))
+  (( filled > cells )) && filled=cells
+  (( filled < 0 )) && filled=0
+  local i s=""
+  for (( i = 0; i < filled; i++ )); do s+="█"; done
+  for (( i = filled; i < cells; i++ )); do s+="░"; done
+  printf '%s' "$s"
+}
+
+fmt_age() {
+  local ts="$1" now diff
+  now="$(date +%s)"
+  diff=$(( now - ts ))
+  (( diff < 0 )) && diff=0
+  if (( diff < 60 )); then printf 'just now'
+  elif (( diff < 3600 )); then printf '%dm ago' $(( diff / 60 ))
+  elif (( diff < 86400 )); then printf '%dh ago' $(( diff / 3600 ))
+  else printf '%dd ago' $(( diff / 86400 )); fi
+}
+
+# ── Credentials / usage probing ───────────────────────────────────────────────
+# Read the OAuth access token from a credentials file (defaults to the live one).
+get_access_token() {
+  local creds_file="${1:-${CLAUDE_DIR}/.credentials.json}"
+  [[ -f "$creds_file" ]] || return 1
+  ruby - "$creds_file" <<'RB'
+require 'json'
+begin
+  data = JSON.parse(File.read(ARGV[0]))
+rescue
+  exit 0
+end
+puts(data.fetch("claudeAiOauth", {}).fetch("accessToken", "") || "")
+RB
+}
+
+# Probe the API rate-limit headers for a given token. Prints a human-readable
+# "5h N% (resets …) · 7d N% (resets …)" string (empty when unavailable) and, when
+# a cache path is given, writes that profile's ".usage" cache. Costs 1 token.
+fetch_usage() {
+  local token="$1" cache_path="${2:-}"
+  [[ -n "$token" ]] || return 0
+
+  ruby - "$token" "$cache_path" <<'RB'
+require 'json'
+require 'net/http'
+require 'uri'
+require 'fileutils'
+
+token = ARGV[0]
+cache_path = ARGV[1].to_s
+
+# Issue the 1-token probe and read the rate-limit response headers directly.
+# On ANY error, degrade to empty output exactly like the old curl path.
+h = {}
+begin
+  uri = URI('https://api.anthropic.com/v1/messages')
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = true
+  http.open_timeout = 15
+  http.read_timeout = 15
+  req = Net::HTTP::Post.new(uri)
+  req['authorization'] = "Bearer #{token}"
+  req['anthropic-version'] = '2023-06-01'
+  req['anthropic-beta'] = 'oauth-2025-04-20'
+  req['content-type'] = 'application/json'
+  req.body = JSON.generate(
+    "model" => "claude-haiku-4-5-20251001",
+    "max_tokens" => 1,
+    "messages" => [{ "role" => "user", "content" => "hi" }]
+  )
+  resp = http.request(req)
+  resp.each_header do |k, v|
+    kl = k.downcase
+    h[kl] = v if kl.start_with?('anthropic-ratelimit-unified-')
+  end
+rescue
+  exit 0
+end
+
+now = Time.now.to_f
+
+countdown = lambda do |epoch|
+  begin
+    secs = epoch.to_i - now
+  rescue
+    return ""
+  end
+  return "now" if secs <= 0
+  mins = (secs / 60).to_i
+  return "#{mins}m" if mins < 60
+  hrs = mins / 60.0
+  hrs < 48 ? format("%.0fh", hrs) : format("%.0fd", hrs / 24)
+end
+
+pct_int = lambda do |v|
+  begin
+    (Float(v) * 100).round
+  rescue
+    nil
+  end
+end
+
+parts = []
+cache = {}
+[["5h", "5h"], ["7d", "7d"]].each do |label, key|
+  u = h["anthropic-ratelimit-unified-#{key}-utilization"]
+  r = h["anthropic-ratelimit-unified-#{key}-reset"]
+  p = u.nil? ? nil : pct_int.call(u)
+  next if p.nil?
+  cache[key] = p
+  tok = "#{label} #{p}%"
+  cd = r ? countdown.call(r) : ""
+  tok += " (resets #{cd})" unless cd.empty?
+  parts << tok
+end
+
+if !cache_path.empty? && (cache.key?("5h") || cache.key?("7d"))
+  begin
+    dir = File.dirname(cache_path)
+    FileUtils.mkdir_p(dir) unless dir.empty?
+    # "-" placeholders keep the three fields positional even when one window
+    # is missing, so `read -r u5 u7 uts` can never shift columns left.
+    File.write(cache_path, "#{cache.fetch('5h', '-')} #{cache.fetch('7d', '-')} #{now.to_i}\n")
+    File.chmod(0o600, cache_path)
+  rescue
+  end
+end
+
+puts parts.join(" · ")
+RB
+}
+
+# True (exit 0) when the OAuth access token in $1 is missing or at/near expiry.
+# A 60s skew means we refresh just before the token actually lapses.
+token_expired() {
+  local creds="$1"
+  [[ -f "$creds" ]] || return 0
+  ruby - "$creds" <<'RB'
+require 'json'
+begin
+  d = JSON.parse(File.read(ARGV[0]))["claudeAiOauth"]
+rescue
+  exit 0  # unreadable → treat as expired
+end
+exp = d && d["expiresAt"]
+exit(exp && exp / 1000.0 > Time.now.to_f + 60 ? 1 : 0)
+RB
+}
+
+# Ask the Claude CLI to mint a fresh OAuth token for a stored profile. Pointing the
+# CLI at the profile's config dir and making one cheap authenticated request lets it
+# transparently refresh an expired access token (via the stored refreshToken) and
+# write the new credentials straight back into the profile dir. Returns 0 if the
+# stored token is fresh afterwards. Costs one tiny Haiku call — only invoked when
+# the stored token is actually expired.
+refresh_profile_token() {
+  local name="$1" dir="$PROFILE_ROOT/$name"
+  command -v claude >/dev/null 2>&1 || return 1
+  local runner=(claude -p "hi" --model claude-haiku-4-5-20251001)
+  if command -v timeout >/dev/null 2>&1; then
+    CLAUDE_CONFIG_DIR="$dir" timeout 90 "${runner[@]}" >/dev/null 2>&1 || true
+  else
+    CLAUDE_CONFIG_DIR="$dir" "${runner[@]}" >/dev/null 2>&1 || true
+  fi
+  [[ -f "$dir/.credentials.json" ]] && ! token_expired "$dir/.credentials.json"
+}
+
+# Refresh one profile's usage cache. Getting a WORKING token is the crux: stored
+# profile tokens go stale (they're only as fresh as the last activation), so we
+#   • use the live ~/.claude token for the active profile (the CLI keeps it fresh),
+#   • otherwise let the CLI refresh the profile's stored token when it's expired.
+# Returns 0 ONLY if the cache was actually rewritten (detected via mtime) — the old
+# implementation returned 0 whenever the stale cache file merely existed, which made
+# a silent 401 look like a successful refresh.
+refresh_profile_usage() {
+  local name="$1"
+  local dir="$PROFILE_ROOT/$name"
+  local cache_path="$dir/.usage"
+  local creds="$dir/.credentials.json"
+
+  local active; active="$(get_active_profile || true)"
+  if [[ "$name" == "$active" && -f "$CLAUDE_DIR/.credentials.json" ]] \
+     && ! token_expired "$CLAUDE_DIR/.credentials.json"; then
+    creds="$CLAUDE_DIR/.credentials.json"
+  elif token_expired "$creds"; then
+    refresh_profile_token "$name" || true
+    creds="$dir/.credentials.json"
+  fi
+
+  local ptoken; ptoken="$(get_access_token "$creds" || true)"
+  [[ -n "$ptoken" ]] || return 1
+
+  local before after
+  before="$(stat -c %Y "$cache_path" 2>/dev/null || echo 0)"
+  fetch_usage "$ptoken" "$cache_path" >/dev/null 2>&1 || true
+  after="$(stat -c %Y "$cache_path" 2>/dev/null || echo 0)"
+  [[ "$after" != "$before" ]]
+}
+
+# Load a profile's cached usage into RU5/RU7/RUTS. "-" placeholders (written when a
+# window is missing) map back to empty. Returns 1 when there is no cache file.
+read_usage_cache() {
+  RU5=""; RU7=""; RUTS=""
+  local f="$PROFILE_ROOT/$1/.usage"
+  [[ -f "$f" ]] || return 1
+  read -r RU5 RU7 RUTS < "$f" 2>/dev/null || true
+  [[ "$RU5" == "-" ]] && RU5=""
+  [[ "$RU7" == "-" ]] && RU7=""
+  return 0
+}
+
+# Print a one-line account summary (identity + real 5h/7d usage + reset
+# countdowns from the API rate-limit headers). If a profile name is given, also
+# writes that profile's .usage cache so the menu can show it later.
+# Degrades gracefully (identity only) when offline or curl is unavailable.
+show_account_status() {
+  local cache_profile="${1:-}"
+  local cache_path=""
+  [[ -n "$cache_profile" ]] && cache_path="$PROFILE_ROOT/$cache_profile/.usage"
+
+  local identity="claude"
+  local auth_status_json
+  auth_status_json="$(claude auth status 2>/dev/null || true)"
+  if [[ -n "$auth_status_json" ]]; then
+    identity="$(ruby - "$auth_status_json" <<'RB'
+require 'json'
+begin
+  data = JSON.parse(ARGV[0])
+rescue
+  data = {}
+end
+email = data["email"] || data["user"] || "claude"
+sub = data["subscriptionType"] || ""
+puts(sub.empty? ? email : "#{email} · #{sub}")
+RB
+)"
+  fi
+
+  local limits token
+  token="$(get_access_token || true)"
+  limits="$(fetch_usage "$token" "$cache_path")"
+
+  if [[ -n "$limits" ]]; then
+    printf '%s%s%s %s·%s %s\n' "$C_BOLD" "$identity" "$C_RESET" "$C_MUTED" "$C_RESET" "$limits"
+  else
+    printf '%s%s%s\n' "$C_BOLD" "$identity" "$C_RESET"
+  fi
+}
+
+# Emit "email<TAB>org<TAB>sub" for a stored profile (empty fields when missing).
+profile_meta() {
+  local dir="$PROFILE_ROOT/$1"
+  ruby - "$dir" <<'RB'
+require 'json'
+d = ARGV[0]
+email = org = sub = ""
+id_path = File.join(d, ".claude.json")
+id_path = File.join(d, "claude.json") unless File.exist?(id_path)  # legacy pre-config-dir name
+begin
+  j = JSON.parse(File.read(id_path))
+  acc = j["oauthAccount"] || {}
+  email = acc["emailAddress"] || ""
+  org = acc["organizationName"] || ""
+rescue
+end
+begin
+  c = JSON.parse(File.read(File.join(d, ".credentials.json")))
+  sub = (c["claudeAiOauth"] || {})["subscriptionType"] || ""
+rescue
+end
+puts [email, org, sub].join("\t")
+RB
+}
+
+# ── Setup / storage ───────────────────────────────────────────────────────────
+require_claude() {
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "Claude CLI was not found on PATH." >&2
+    echo "Install it first or add it to your PATH." >&2
+    exit 1
+  fi
+}
+
+# Ruby is the engine for every subcommand (all the JSON/token/usage logic runs in
+# embedded Ruby). Verify the interpreter and the stdlib modules we rely on are all
+# present up front, so a missing dependency fails with a clear message instead of a
+# cryptic error deep inside a heredoc.
+require_ruby() {
+  if ! command -v ruby >/dev/null 2>&1; then
+    echo "Ruby was not found on PATH." >&2
+    echo "Install Ruby (>= 2.5) — e.g. 'sudo apt install ruby' or 'brew install ruby'." >&2
+    exit 1
+  fi
+  if ! ruby -e "require 'json'; require 'net/http'" >/dev/null 2>&1; then
+    echo "This Ruby is missing required stdlib modules (json, net/http)." >&2
+    echo "Install a complete Ruby distribution and try again." >&2
+    exit 1
+  fi
+}
+
+# The dashboard sidecar needs the 'webrick' HTTP server. It ships with Ruby < 3.0
+# but is a separate gem on 3.0+, so check it only when 'serve' is invoked and point
+# the user at the one-line fix rather than letting the sidecar crash on require.
+require_webrick() {
+  if ! ruby -e "require 'webrick'" >/dev/null 2>&1; then
+    echo "The dashboard needs the 'webrick' gem, which isn't available." >&2
+    echo "Install it with:  gem install webrick" >&2
+    exit 1
+  fi
+}
+
+ensure_storage() {
+  mkdir -p "$PROFILE_ROOT"
+  chmod 700 "$PROFILE_ROOT"
+}
+
+list_profiles() {
+  find "$PROFILE_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' 2>/dev/null | sort
+}
+
+get_active_profile() {
+  if [[ -f "$ACTIVE_PROFILE_FILE" ]]; then
+    cat "$ACTIVE_PROFILE_FILE"
+  fi
+}
+
+sanitize_profile_name() {
+  local raw_name="${1:-}"
+  local sanitized
+  sanitized="$(echo "$raw_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g; s/--*/-/g; s/^[-.]*//; s/[-.]*$//')"
+  if [[ -z "$sanitized" ]]; then
+    sanitized="profile-$(date +%Y%m%d-%H%M%S)"
+  fi
+  echo "$sanitized"
+}
+
+# A profile directory IS a usable CLAUDE_CONFIG_DIR — point `claude` (or T3) at it
+# via CLAUDE_CONFIG_DIR=<profile dir>. It holds the two files Claude reads there:
+#   <profile>/.credentials.json  <- ~/.claude/.credentials.json
+#   <profile>/.claude.json       <- ~/.claude.json (account identity / config)
+# (Older profiles used the un-dotted "claude.json"; reads fall back to it.)
+
+# Resolve a profile's identity file for READING (new dotted name, else legacy).
+profile_identity_path() {
+  local dir="$1"
+  if [[ -f "$dir/.claude.json" ]]; then printf '%s' "$dir/.claude.json"
+  elif [[ -f "$dir/claude.json" ]]; then printf '%s' "$dir/claude.json"
+  else printf '%s' "$dir/.claude.json"; fi
+}
+
+# Installed CLI version (e.g. 2.1.200), cached for the process. Empty if unknown.
+CLAUDE_VERSION=""
+claude_version() {
+  if [[ -z "$CLAUDE_VERSION" ]]; then
+    CLAUDE_VERSION="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  fi
+  printf '%s' "$CLAUDE_VERSION"
+}
+
+# Make a profile dir safe to use DIRECTLY as CLAUDE_CONFIG_DIR (the whole point of
+# the config-dir support). A profile born from the isolated `claude auth login`
+# gets a .claude.json WITHOUT `hasCompletedOnboarding` (that flag is only written
+# once the interactive onboarding wizard finishes). Pointing CLAUDE_CONFIG_DIR at
+# such a dir re-runs onboarding — which prompts to log in again even though the
+# stored credentials are valid. Stamp the "already onboarded" markers so it won't.
+# Also migrates a legacy un-dotted claude.json to the dotted name claude reads as a
+# config dir. Idempotent (no write when already correct); preserves all fields.
+normalize_profile_identity() {
+  local name="$1"
+  local dir="$PROFILE_ROOT/$name"
+  local dotted="$dir/.claude.json"
+  local legacy="$dir/claude.json"
+
+  if [[ ! -f "$dotted" && -f "$legacy" ]]; then
+    cp "$legacy" "$dotted" 2>/dev/null || true
+    chmod 600 "$dotted" 2>/dev/null || true
+  fi
+
+  ruby - "$dotted" "$(claude_version)" <<'RB'
+require 'json'
+path, ver = ARGV[0], ARGV[1]
+begin
+  data = JSON.parse(File.read(path))
+rescue
+  data = {}
+end
+data = {} unless data.is_a?(Hash)
+changed = false
+if data["hasCompletedOnboarding"] != true
+  data["hasCompletedOnboarding"] = true
+  changed = true
+end
+if ver && !ver.empty? && data["lastOnboardingVersion"] != ver
+  data["lastOnboardingVersion"] = ver
+  changed = true
+end
+if changed
+  tmp = path + ".tmp"
+  File.write(tmp, JSON.generate(data))
+  File.rename(tmp, path)
+  File.chmod(0o600, path)
+end
+RB
+}
+
+# One-time (idempotent) migration of all stored profiles at startup.
+migrate_profiles() {
+  local n
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && normalize_profile_identity "$n"
+  done < <(list_profiles)
+}
+
+save_current_profile() {
+  local name="$1"
+  local target_dir="$PROFILE_ROOT/$name"
+
+  mkdir -p "$target_dir"
+
+  if [[ -f "$CLAUDE_DIR/.credentials.json" ]]; then
+    cp "$CLAUDE_DIR/.credentials.json" "$target_dir/.credentials.json"
+    chmod 600 "$target_dir/.credentials.json" 2>/dev/null || true
+  fi
+  if [[ -f "$CLAUDE_CONFIG" ]]; then
+    cp "$CLAUDE_CONFIG" "$target_dir/.claude.json"
+    chmod 600 "$target_dir/.claude.json" 2>/dev/null || true
+  fi
+}
+
+activate_profile() {
+  local name="$1"
+  local save_current_state="${2:-true}"
+  local source_dir="$PROFILE_ROOT/$name"
+
+  if [[ ! -d "$source_dir" ]]; then
+    echo "Profile '$name' does not exist." >&2
+    return 1
+  fi
+
+  # Ensure the identity we're about to copy into ~/.claude is marked onboarded, so
+  # bare `claude` doesn't re-run onboarding after a switch either.
+  normalize_profile_identity "$name"
+
+  local current_active
+  current_active="$(get_active_profile || true)"
+
+  if [[ "$save_current_state" == "true" && -n "$current_active" && "$current_active" != "$name" ]]; then
+    save_current_profile "$current_active" >/dev/null 2>&1 || true
+  fi
+
+  if [[ ! -f "$source_dir/.credentials.json" ]]; then
+    echo "Profile '$name' has no saved credentials; cannot activate." >&2
+    return 1
+  fi
+
+  mkdir -p "$CLAUDE_DIR"
+  cp "$source_dir/.credentials.json" "$CLAUDE_DIR/.credentials.json"
+  chmod 600 "$CLAUDE_DIR/.credentials.json" 2>/dev/null || true
+  local id_file
+  id_file="$(profile_identity_path "$source_dir")"
+  if [[ -f "$id_file" ]]; then
+    cp "$id_file" "$CLAUDE_CONFIG"
+    chmod 600 "$CLAUDE_CONFIG" 2>/dev/null || true
+  fi
+
+  printf '%s\n' "$name" > "$ACTIVE_PROFILE_FILE"
+  chmod 600 "$ACTIVE_PROFILE_FILE" 2>/dev/null || true
+  printf '%s✓%s Activated Claude profile: %s%s%s\n' "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
+  show_account_status "$name"
+  # This profile dir also works directly as a config dir (e.g. for T3):
+  printf '%s  config dir:%s %s%s%s\n' "$C_MUTED" "$C_RESET" "$C_ACCENT" "$source_dir" "$C_RESET"
+  printf '%s  export CLAUDE_CONFIG_DIR=%q%s\n' "$C_DIM" "$source_dir" "$C_RESET"
+}
+
+# ── Menu data + rendering ─────────────────────────────────────────────────────
+build_profile_meta() {
+  P_EMAIL=(); P_ORG=(); P_SUB=(); P_U5=(); P_U7=(); P_UTS=()
+  local i n meta e o s u5 u7 uts
+  for i in "${!PROFILES[@]}"; do
+    n="${PROFILES[$i]}"
+    meta="$(profile_meta "$n" 2>/dev/null || true)"
+    IFS=$'\t' read -r e o s <<< "$meta"
+    P_EMAIL[i]="${e:-}"; P_ORG[i]="${o:-}"; P_SUB[i]="${s:-}"
+    RU5=""; RU7=""; RUTS=""
+    read_usage_cache "$n" || true
+    P_U5[i]="${RU5:-}"; P_U7[i]="${RU7:-}"; P_UTS[i]="${RUTS:-}"
+  done
+}
+
+# Build a profile row BODY (no left marker) in both plain and coloured forms into
+# globals ROW_BODY_PLAIN / ROW_BODY_COLOR. Marker (2 cols) is added by the caller,
+# so `width` here is the space AFTER the marker.
+build_profile_row() {
+  local idx="$1" width="$2"
+  local name="${PROFILES[$idx]}"
+  local email="${P_EMAIL[$idx]}" org="${P_ORG[$idx]}"
+  local u5="${P_U5[$idx]}" u7="${P_U7[$idx]}" uts="${P_UTS[$idx]}"
+
+  local name_w=14
+
+  # Usage segment. Every field is a FIXED width so the 5h/7d columns line up
+  # row-to-row and the block sits flush against the right edge of the card, no
+  # matter how long each profile name / identity is. Layout (36 cols):
+  #   5h ████  NN%   (12)  ·  gap (2)  ·  7d ████  NN%   (12)  ·  gap (2)  ·  age (8)
+  local usage_w=36
+  local usage_plain="" usage_color="" show_usage=false
+  if [[ -n "$u5" || -n "$u7" ]] && (( width >= 70 )); then
+    show_usage=true
+    local w5p w5c w7p w7c age_p age_c
+    if [[ -n "$u5" ]]; then
+      w5p="$(printf '5h %s %3s%%' "$(bar_plain "$u5" 4)" "$u5")"
+      w5c="${C_MUTED}5h${C_RESET} $(render_bar "$u5" 4 "$(sem_color "$u5")") $(sem_color "$u5")$(printf '%3s' "$u5")%${C_RESET}"
+    else
+      w5p="$(printf '%12s' '')"; w5c="$w5p"
+    fi
+    if [[ -n "$u7" ]]; then
+      w7p="$(printf '7d %s %3s%%' "$(bar_plain "$u7" 4)" "$u7")"
+      w7c="${C_MUTED}7d${C_RESET} $(render_bar "$u7" 4 "$(sem_color "$u7")") $(sem_color "$u7")$(printf '%3s' "$u7")%${C_RESET}"
+    else
+      w7p="$(printf '%12s' '')"; w7c="$w7p"
+    fi
+    # Cache age — staleness matters when picking a failover target.
+    if [[ -n "$uts" && "$uts" =~ ^[0-9]+$ ]]; then
+      local age; age="$(fmt_age "$uts")"
+      age_p="$(printf '%-8s' "$age")"
+      age_c="${C_DIM}${age_p}${C_RESET}"
+    else
+      age_p="$(printf '%8s' '')"; age_c="$age_p"
+    fi
+    usage_plain="${w5p}  ${w7p}  ${age_p}"
+    usage_color="${w5c}  ${w7c}  ${age_c}"
+  fi
+
+  # Identity: "email · org", truncated to whatever space is left.
+  local ident=""
+  if [[ -n "$email" ]]; then
+    ident="$email"
+    [[ -n "$org" ]] && ident+=" $GLYPH_DOT $org"
+  else
+    ident="(no identity saved)"
+  fi
+
+  # Column budget: name_w + gap(2) + ident + gap(3) + usage(fixed). ident is PADDED
+  # to its full width (not just truncated) so the usage block always starts at the
+  # same column and ends flush at the card's right edge.
+  local usage_cols=0
+  [[ "$show_usage" == true ]] && usage_cols=$(( usage_w + 3 ))
+  local ident_w=$(( width - name_w - 2 - usage_cols ))
+  if (( ident_w < 6 )); then
+    ident_w=$(( width - name_w - 2 )); show_usage=false
+  fi
+  local ident_plain
+  ident_plain="$(pad_to "$ident_w" "$ident")"
+
+  local name_plain
+  name_plain="$(pad_to "$name_w" "$name")"
+
+  ROW_BODY_PLAIN="${name_plain}  ${ident_plain}"
+  [[ "$show_usage" == true ]] && ROW_BODY_PLAIN+="   ${usage_plain}"
+
+  local ident_c="${C_DIM}${ident_plain}${C_RESET}"
+  ROW_BODY_COLOR="${C_BOLD}${name_plain}${C_RESET}  ${ident_c}"
+  [[ "$show_usage" == true ]] && ROW_BODY_COLOR+="   ${usage_color}"
+  return 0
+}
+
+render_menu() {
+  local active_profile="$1"
+  local selected_index="$2"
+  local profile_count="$3"
+
+  local cols card
+  cols="$(term_cols)"
+  card=$(( cols - 4 ))
+  (( card > 92 )) && card=92
+  (( card < 40 )) && card=40
+
+  local rule=""
+  local i
+  for (( i = 0; i < card; i++ )); do rule+="─"; done
+
+  hide_cursor
+
+  local out=""
+  local nl=$'\n'
+  local clr=$'\033[K'          # clear-to-EOL erases stale glyphs on shrink
+  local body_w=$(( card - 2 )) # width available after the 2-col marker
+  add() { out+="$1$clr$nl"; }
+
+  # A selectable line: pointer marker when selected, else the given (coloured)
+  # marker; body filled to the card width under a solid accent bar when selected.
+  emit_line() {
+    local selected="$1" marker_color="$2" body_plain="$3" body_color="$4"
+    if [[ "$selected" == true ]]; then
+      add "  ${C_SEL}$(pad_to "$card" "${GLYPH_POINTER} ${body_plain}")${C_RESET}"
+    else
+      add "  ${marker_color}${body_color}"
+    fi
+  }
+
+  add ""
+  add "  ${C_TITLE}Claude account switcher${C_RESET}"
+  add "  ${C_MUTED}${PROFILE_ROOT}${C_RESET}   ${C_MUTED}active:${C_RESET} ${C_ACCENT}${active_profile:-none}${C_RESET}"
+  add "  ${C_RULE}${rule}${C_RESET}"
+  add ""
+
+  local add_idx=$(( profile_count ))
+  local quit_idx=$(( profile_count + 1 ))
+
+  if (( profile_count > 0 )); then
+    add "  ${C_MUTED}PROFILES${C_RESET}"
+    for (( i = 0; i < profile_count; i++ )); do
+      build_profile_row "$i" "$body_w"
+      local mk="  "
+      [[ "${PROFILES[$i]}" == "$active_profile" ]] && mk="${C_ACTIVE}${GLYPH_ACTIVE}${C_RESET} "
+      local sel=false
+      (( i == selected_index )) && sel=true
+      emit_line "$sel" "$mk" "$ROW_BODY_PLAIN" "$ROW_BODY_COLOR"
+    done
+    add ""
+  fi
+
+  add "  ${C_MUTED}ACTIONS${C_RESET}"
+  local add_sel=false quit_sel=false
+  (( selected_index == add_idx )) && add_sel=true
+  (( selected_index == quit_idx )) && quit_sel=true
+  emit_line "$add_sel" "${C_ACCENT}+${C_RESET} " "Add a new profile" "Add a new profile"
+  emit_line "$quit_sel" "${C_MUTED}⏻${C_RESET} " "Quit" "Quit"
+
+  add ""
+  add "  ${C_RULE}${rule}${C_RESET}"
+  # Config-dir path of the selected profile — copy it into T3 as CLAUDE_CONFIG_DIR.
+  if (( profile_count > 0 && selected_index < profile_count )); then
+    add "  ${C_MUTED}config dir:${C_RESET} ${C_ACCENT}${PROFILE_ROOT}/${PROFILES[$selected_index]}${C_RESET}"
+  fi
+  local keybar="  ${C_KEY}↑↓${C_RESET}${C_MUTED} move   ${C_RESET}${C_KEY}⏎${C_RESET}${C_MUTED} select   ${C_RESET}"
+  (( profile_count > 0 )) && keybar+="${C_KEY}r${C_RESET}${C_MUTED} refresh usage   ${C_RESET}"
+  keybar+="${C_KEY}a${C_RESET}${C_MUTED} add   ${C_RESET}${C_KEY}q${C_RESET}${C_MUTED} quit${C_RESET}"
+  add "$keybar"
+
+  # One write, from home, clearing anything below the frame — no full-screen flash.
+  printf '\033[H%s\033[J' "$out"
+  unset -f add
+  unset -f emit_line
+}
+
+read_key() {
+  local -n output_ref="$1"
+  local char
+  local seq1
+  local seq2
+
+  if ! IFS= read -r -s -n 1 char; then
+    output_ref=""
+    return 1
+  fi
+
+  if [[ -z "$char" ]]; then
+    output_ref=$'\n'
+    return 0
+  fi
+
+  if [[ "$char" == $'\n' || "$char" == $'\r' ]]; then
+    output_ref=$'\n'
+    return 0
+  fi
+
+  if [[ "$char" == $'\e' ]]; then
+    if IFS= read -r -s -n 1 -t 0.05 seq1; then
+      case "$seq1" in
+        '['|'O')
+          if IFS= read -r -s -n 1 -t 0.05 seq2; then
+            case "$seq2" in
+              A|B|C|D)
+                output_ref="$char$seq1$seq2"
+                ;;
+              *)
+                output_ref="$char"
+                ;;
+            esac
+          else
+            output_ref="$char"
+          fi
+          ;;
+        *)
+          output_ref="$char"
+          ;;
+      esac
+    else
+      output_ref="$char"
+    fi
+  else
+    output_ref="$char"
+  fi
+
+  return 0
+}
+
+show_menu() {
+  enable_raw_mode
+
+  PROFILES=()
+  local profile
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] && PROFILES+=("$profile")
+  done < <(list_profiles)
+
+  build_profile_meta
+
+  local active_profile
+  active_profile="$(get_active_profile || true)"
+
+  local selected_index=0
+  local profile_count=${#PROFILES[@]}
+
+  if (( profile_count > 0 )); then
+    for i in "${!PROFILES[@]}"; do
+      if [[ "${PROFILES[$i]}" == "$active_profile" ]]; then
+        selected_index="$i"
+        break
+      fi
+    done
+  fi
+
+  enter_alt_screen
+  clear_screen
+
+  local add_idx=$(( profile_count ))
+  local quit_idx=$(( profile_count + 1 ))
+
+  activate_selected() {
+    local sel="${PROFILES[$selected_index]}"
+    disable_raw_mode
+    leave_alt_screen
+    activate_profile "$sel"
+    echo
+    echo "You can now run: claude auth status  (or just use: claude)"
+  }
+
+  while true; do
+    render_menu "$active_profile" "$selected_index" "$profile_count"
+
+    local key
+    if ! read_key key; then
+      quit_program
+      return 0
+    fi
+
+    case "$key" in
+      $'\e')
+        quit_program
+        ;;
+      $'\e[A'|$'\eOA')
+        if (( profile_count > 0 )); then
+          if (( selected_index == 0 )); then
+            selected_index=$(( profile_count + 1 ))
+          elif (( selected_index == profile_count )); then
+            selected_index=$(( profile_count - 1 ))
+          else
+            selected_index=$(( selected_index - 1 ))
+          fi
+        else
+          # No profiles: only "Add" (0) and "Quit" (1) — move relative + wrap.
+          selected_index=$(( (selected_index + 1) % 2 ))
+        fi
+        ;;
+      $'\e[B'|$'\eOB')
+        if (( profile_count > 0 )); then
+          if (( selected_index == profile_count + 1 )); then
+            selected_index=0
+          elif (( selected_index == profile_count - 1 )); then
+            selected_index=$(( profile_count ))
+          else
+            selected_index=$(( selected_index + 1 ))
+          fi
+        else
+          selected_index=$(( (selected_index + 1) % 2 ))
+        fi
+        ;;
+      r|R)
+        # Refresh the selected profile's usage on demand. refresh_profile_usage
+        # sources a working token (live creds for the active profile, else a CLI
+        # token refresh) so BOTH the 5h and 7d windows actually update.
+        if (( profile_count > 0 && selected_index < profile_count )); then
+          local rname="${PROFILES[$selected_index]}"
+          render_menu "$active_profile" "$selected_index" "$profile_count"
+          printf '\r  %s⟳ refreshing %s…%s' "$C_ACCENT" "$rname" "$C_RESET"
+          local refresh_ok=true
+          refresh_profile_usage "$rname" || refresh_ok=false
+          # Reload the cache into the in-memory arrays so the row updates.
+          RU5=""; RU7=""; RUTS=""
+          read_usage_cache "$rname" || true
+          P_U5[selected_index]="${RU5:-}"
+          P_U7[selected_index]="${RU7:-}"
+          P_UTS[selected_index]="${RUTS:-}"
+          if [[ "$refresh_ok" != true ]]; then
+            printf '\r  %s⚠ could not refresh %s (sign in again to renew its token)%s%*s' \
+              "$C_AMBER" "$rname" "$C_RESET" 12 ''
+            sleep 1.8
+          fi
+        fi
+        ;;
+      a|A)
+        if add_new_profile; then
+          return 0
+        fi
+        # Cancelled — rebuild the alt-screen menu state and continue.
+        enable_raw_mode
+        enter_alt_screen
+        clear_screen
+        continue
+        ;;
+      q|Q)
+        quit_program
+        ;;
+      $'\n'|$'\r')
+        if (( profile_count > 0 && selected_index < profile_count )); then
+          activate_selected
+          return 0
+        elif (( selected_index == add_idx )); then
+          if add_new_profile; then
+            return 0
+          fi
+          enable_raw_mode
+          enter_alt_screen
+          clear_screen
+          continue
+        elif (( selected_index == quit_idx )); then
+          quit_program
+        fi
+        ;;
+    esac
+  done
+}
+
+credentials_ready() {
+  local creds_file="${1:-${CLAUDE_DIR}/.credentials.json}"
+  [[ -f "$creds_file" ]] || return 1
+  grep -q '"accessToken"' "$creds_file" 2>/dev/null
+}
+
+prompt_for_profile_name() {
+  local prompt_text="$1"
+  local -n output_ref="$2"
+  local input=""
+  local key
+
+  show_cursor  # text entry — cursor is wanted here
+  printf '%s' "$prompt_text"
+  trap 'trap - INT; printf "\n"; output_ref=""; return 3' INT
+
+  while true; do
+    if ! read_key key; then
+      trap - INT
+      output_ref=""
+      return 1
+    fi
+
+    case "$key" in
+      $'\e')
+        trap - INT
+        printf '\n'
+        output_ref=""
+        return 2
+        ;;
+      $'\n'|$'\r')
+        trap - INT
+        printf '\n'
+        output_ref="$input"
+        return 0
+        ;;
+      $'\177'|$'\b')
+        if (( ${#input} > 0 )); then
+          input="${input%?}"
+          printf '\b \b'
+        fi
+        ;;
+      *)
+        # Only accept a single printable char. Arrow keys etc. arrive as
+        # multi-char escape sequences (e.g. $'\e[C') — ignore them so they can't
+        # move the cursor over the prompt or land in the name.
+        if (( ${#key} == 1 )) && [[ "$key" =~ [[:print:]] ]]; then
+          input+="$key"
+          printf '%s' "$key"
+        fi
+        ;;
+    esac
+  done
+}
+
+add_new_profile() {
+  local new_name=""
+  local prompt_status
+
+  clear_screen
+  hide_cursor
+  printf '  %sAdd a new profile%s\n\n' "$C_TITLE" "$C_RESET"
+  prompt_for_profile_name "  ${C_ACCENT}New profile name${C_RESET} ${C_MUTED}›${C_RESET} " new_name
+  prompt_status=$?
+
+  case "$prompt_status" in
+    1|2|3)
+      printf '\n'
+      return 1
+      ;;
+  esac
+
+  new_name="$(sanitize_profile_name "$new_name")"
+
+  if [[ -d "$PROFILE_ROOT/$new_name" ]]; then
+    local confirm_key
+    printf "\n  %sProfile '%s' already exists. Overwrite it?%s %s[y/N]%s " \
+      "$C_AMBER" "$new_name" "$C_RESET" "$C_MUTED" "$C_RESET"
+    read_key confirm_key || confirm_key=""
+    printf '\n'
+    if [[ "$confirm_key" != "y" && "$confirm_key" != "Y" ]]; then
+      echo "  Cancelled."
+      return 1
+    fi
+  fi
+
+  # Login is interactive, so hand the real terminal back before launching it. We do
+  # NOT clear the screen here: `claude auth login` scrolls the terminal (browser URL,
+  # paste-code prompt), and a later \033[2J would clear relative to the scrolled
+  # viewport, stranding output at an odd offset. Instead everything below flows as
+  # normal inline output so the shell prompt lands cleanly after the summary.
+  disable_raw_mode
+  leave_alt_screen
+  printf '\n%sCreating profile:%s %s%s%s\n\n' "$C_MUTED" "$C_RESET" "$C_BOLD" "$new_name" "$C_RESET"
+
+  local target_dir="$PROFILE_ROOT/$new_name"
+  local pre_existed=true
+  [[ -d "$target_dir" ]] || pre_existed=false
+  mkdir -p "$target_dir"
+  chmod 700 "$target_dir" 2>/dev/null || true
+
+  # Log in DIRECTLY into the profile's own config dir. CLAUDE_CONFIG_DIR isolates
+  # the whole login: credentials + identity are written straight into the dir and
+  # the global ~/.claude session is never touched — so no logout / backup / restore
+  # dance is needed, and the dir is immediately usable as a config dir (e.g. by T3).
+  echo "Starting Claude login (isolated to this profile)..."
+  echo "Complete the sign-in in your browser or terminal prompt."
+  echo
+
+  if CLAUDE_CONFIG_DIR="$target_dir" claude auth login \
+     && credentials_ready "$target_dir/.credentials.json"; then
+    chmod 600 "$target_dir/.credentials.json" 2>/dev/null || true
+    [[ -f "$target_dir/.claude.json" ]] && chmod 600 "$target_dir/.claude.json" 2>/dev/null || true
+    # A fresh login leaves onboarding "incomplete"; stamp it so the dir is usable
+    # directly as CLAUDE_CONFIG_DIR without re-prompting login.
+    normalize_profile_identity "$new_name"
+    # Separator only — no screen clear (see note above). Summary flows inline.
+    printf '\n%s%s%s\n' "$C_RULE" "────────────────────────────────────────" "$C_RESET"
+    # Also make it the active global account for bare `claude` (saves the previous).
+    activate_profile "$new_name"
+    printf '%s✓%s Created profile %s%s%s.\n' \
+      "$C_GREEN" "$C_RESET" "$C_BOLD" "$new_name" "$C_RESET"
+    return 0
+  fi
+
+  # Sign-in didn't complete — nothing global was touched. Remove the dir only if we
+  # created it here (don't delete a pre-existing profile the user chose to overwrite).
+  if [[ "$pre_existed" == false ]]; then
+    rm -rf "$target_dir"
+  fi
+  echo >&2
+  echo "Claude login did not complete; profile '$new_name' was not created." >&2
+  exit 1
+}
+
+# ── CLI subcommands ───────────────────────────────────────────────────────────
+# Emit a JSON array of every stored profile with cached usage + active flag. This
+# is the stable contract the dashboard/GUI consumes:
+#   [{name, email, org, sub, active, u5, u7, uts}]
+# u5/u7/uts are null when there is no cache (or that window is missing). Read-only:
+# it never probes the API — it only reflects the on-disk .usage cache.
+list_profiles_json() {
+  local active; active="$(get_active_profile || true)"
+  ruby - "$PROFILE_ROOT" "$active" <<'RB'
+require 'json'
+root = ARGV[0]
+active = ARGV[1].to_s
+out = []
+(Dir.exist?(root) ? Dir.children(root) : []).sort.each do |name|
+  next if name.start_with?('.')
+  dir = File.join(root, name)
+  next unless File.directory?(dir)
+  email = org = sub = ""
+  id_path = File.join(dir, ".claude.json")
+  id_path = File.join(dir, "claude.json") unless File.exist?(id_path)
+  begin
+    j = JSON.parse(File.read(id_path))
+    acc = j["oauthAccount"] || {}
+    email = acc["emailAddress"] || ""
+    org = acc["organizationName"] || ""
+  rescue
+  end
+  begin
+    c = JSON.parse(File.read(File.join(dir, ".credentials.json")))
+    sub = (c["claudeAiOauth"] || {})["subscriptionType"] || ""
+  rescue
+  end
+  u5 = u7 = uts = nil
+  begin
+    parts = File.read(File.join(dir, ".usage")).strip.split(/\s+/)
+    if parts.length >= 3
+      u5 = parts[0] == "-" ? nil : parts[0].to_i
+      u7 = parts[1] == "-" ? nil : parts[1].to_i
+      uts = parts[2].to_i
+    end
+  rescue
+  end
+  out << {
+    "name" => name, "email" => email, "org" => org, "sub" => sub,
+    "active" => (name == active),
+    "u5" => u5, "u7" => u7, "uts" => uts
+  }
+end
+puts JSON.generate(out)
+RB
+}
+
+cmd_list() {
+  if [[ "${1:-}" == "--json" ]]; then
+    list_profiles_json
+    return 0
+  fi
+  local active; active="$(get_active_profile || true)"
+  local n meta e o s
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    meta="$(profile_meta "$n" 2>/dev/null || true)"
+    IFS=$'\t' read -r e o s <<< "$meta"
+    RU5=""; RU7=""; RUTS=""
+    read_usage_cache "$n" || true
+    local mark="  "
+    [[ "$n" == "$active" ]] && mark="${C_ACTIVE}${GLYPH_ACTIVE}${C_RESET} "
+    local usage=""
+    [[ -n "$RU5" ]] && usage+="5h ${RU5}%"
+    [[ -n "$RU7" ]] && usage+="${usage:+  }7d ${RU7}%"
+    printf '%s%s%-14s%s  %s%s%s   %s\n' \
+      "$mark" "$C_BOLD" "$n" "$C_RESET" "$C_DIM" "${e:-(no identity)}${o:+ $GLYPH_DOT $o}" "$C_RESET" "$usage"
+  done < <(list_profiles)
+}
+
+cmd_status() {
+  if [[ "${1:-}" == "--json" ]]; then
+    local active; active="$(get_active_profile || true)"
+    local token limits
+    token="$(get_access_token || true)"
+    limits="$(fetch_usage "$token" "" 2>/dev/null || true)"
+    ruby - "$active" "$limits" <<'RB'
+require 'json'
+puts JSON.generate("active" => (ARGV[0].to_s.empty? ? nil : ARGV[0]), "usage" => ARGV[1].to_s)
+RB
+    return 0
+  fi
+  local active; active="$(get_active_profile || true)"
+  printf '%sactive:%s %s%s%s\n' "$C_MUTED" "$C_RESET" "$C_ACCENT" "${active:-none}" "$C_RESET"
+  show_account_status "$active"
+}
+
+cmd_refresh() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: $(basename "$0") refresh <profile>" >&2
+    return 2
+  fi
+  if [[ ! -d "$PROFILE_ROOT/$name" ]]; then
+    echo "Profile '$name' does not exist." >&2
+    return 1
+  fi
+  local ok=true
+  refresh_profile_usage "$name" || ok=false
+  RU5=""; RU7=""; RUTS=""
+  read_usage_cache "$name" || true
+  if [[ "$ok" == true ]]; then
+    printf '%s✓%s refreshed %s%s%s  5h %s%%  7d %s%%\n' \
+      "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" "${RU5:-–}" "${RU7:-–}"
+  else
+    printf '%s⚠%s could not refresh %s (sign in again to renew its token)\n' \
+      "$C_AMBER" "$C_RESET" "$name" >&2
+    return 1
+  fi
+}
+
+cmd_activate() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: $(basename "$0") activate <profile>" >&2
+    return 2
+  fi
+  activate_profile "$name"
+}
+
+# CLI add: interactive browser login, but plain terminal I/O (no alt-screen / raw
+# mode). Accepts an optional name argument, otherwise prompts on the plain tty.
+cmd_add() {
+  local new_name="${1:-}"
+  if [[ -z "$new_name" ]]; then
+    printf '%sNew profile name%s ' "$C_ACCENT" "$C_RESET"
+    IFS= read -r new_name || return 1
+  fi
+  new_name="$(sanitize_profile_name "$new_name")"
+
+  local target_dir="$PROFILE_ROOT/$new_name"
+  local pre_existed=true
+  if [[ -d "$target_dir" ]]; then
+    printf "%sProfile '%s' already exists. Overwrite it?%s [y/N] " \
+      "$C_AMBER" "$new_name" "$C_RESET"
+    local ans; IFS= read -r ans || ans=""
+    if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
+      echo "Cancelled."
+      return 1
+    fi
+  else
+    pre_existed=false
+  fi
+
+  mkdir -p "$target_dir"
+  chmod 700 "$target_dir" 2>/dev/null || true
+
+  printf '\n%sCreating profile:%s %s%s%s\n\n' "$C_MUTED" "$C_RESET" "$C_BOLD" "$new_name" "$C_RESET"
+  echo "Starting Claude login (isolated to this profile)..."
+  echo "Complete the sign-in in your browser or terminal prompt."
+  echo
+
+  if CLAUDE_CONFIG_DIR="$target_dir" claude auth login \
+     && credentials_ready "$target_dir/.credentials.json"; then
+    chmod 600 "$target_dir/.credentials.json" 2>/dev/null || true
+    [[ -f "$target_dir/.claude.json" ]] && chmod 600 "$target_dir/.claude.json" 2>/dev/null || true
+    normalize_profile_identity "$new_name"
+    printf '\n%s%s%s\n' "$C_RULE" "────────────────────────────────────────" "$C_RESET"
+    activate_profile "$new_name"
+    printf '%s✓%s Created profile %s%s%s.\n' \
+      "$C_GREEN" "$C_RESET" "$C_BOLD" "$new_name" "$C_RESET"
+    return 0
+  fi
+
+  [[ "$pre_existed" == false ]] && rm -rf "$target_dir"
+  echo "Claude login did not complete; profile '$new_name' was not created." >&2
+  return 1
+}
+
+# Resolve the absolute, symlink-followed path of THIS script. Portable across Linux
+# and macOS (BSD `readlink` has no -f), so `claudius` can be a symlink on PATH while
+# the dashboard sidecar is still found sitting next to the real script file.
+resolve_script_path() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [[ -h "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+  printf '%s/%s\n' "$dir" "$(basename "$src")"
+}
+
+# Launch the localhost dashboard sidecar. Hands off to Ruby entirely (exec), passing
+# the profile root and this script's REAL path so the sidecar can shell mutations
+# back in even when we were invoked through a PATH symlink (e.g. `claudius`).
+cmd_serve() {
+  local script_path script_dir dashboard
+  script_path="$(resolve_script_path)"
+  script_dir="$(dirname "$script_path")"
+  dashboard="$script_dir/claude-dashboard.rb"
+  # Fall back to the legacy $HOME location for pre-install layouts.
+  [[ -f "$dashboard" ]] || dashboard="${HOME}/claude-dashboard.rb"
+  if [[ ! -f "$dashboard" ]]; then
+    echo "Dashboard not found next to $script_path (or in \$HOME)." >&2
+    return 1
+  fi
+  require_webrick
+  exec ruby "$dashboard" --root "$PROFILE_ROOT" --script "$script_path" "$@"
+}
+
+cmd_help() {
+  local prog; prog="$(basename "$0")"
+  cat <<EOF
+${C_TITLE}${prog}${C_RESET} — manage & monitor Claude accounts
+
+${C_MUTED}USAGE${C_RESET}
+  $prog                      launch the interactive TUI (default)
+  $prog list [--json]        list profiles + cached usage (+ active flag)
+  $prog status [--json]      show the active profile's live identity + usage
+  $prog refresh <profile>    renew token if needed & rewrite the usage cache
+  $prog activate <profile>   switch the global ~/.claude to <profile>
+  $prog add [name]           add a new profile (interactive browser login)
+  $prog serve [--port N] [--open]
+                             run the localhost dashboard (browser tab)
+  $prog help | -h            show this help
+
+${C_MUTED}NOTES${C_RESET}
+  • --json output is the stable contract consumed by the dashboard.
+  • 'add' needs an interactive terminal (browser sign-in); it is CLI-only.
+EOF
+}
+
+main() {
+  set -euo pipefail
+  trap cleanup EXIT
+  init_colors
+  require_ruby
+  require_claude
+  ensure_storage
+  migrate_profiles
+
+  local sub="${1:-}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$sub" in
+    ""|menu)   show_menu; disable_raw_mode; leave_alt_screen ;;
+    list)      cmd_list "$@" ;;
+    status)    cmd_status "$@" ;;
+    refresh)   cmd_refresh "$@" ;;
+    activate)  cmd_activate "$@" ;;
+    add)       cmd_add "$@" ;;
+    serve)     cmd_serve "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      echo "Unknown command: $sub" >&2
+      echo "Run '$(basename "$0") help' for usage." >&2
+      exit 2
+      ;;
+  esac
+}
+
+# Sourced-safe launcher. When executed as a program, run main directly. When
+# *sourced*, run main inside a subshell so its `set -euo pipefail`, EXIT trap, and
+# any `exit` stay contained and never terminate the caller's interactive shell.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  ( main "$@" )
+else
+  main "$@"
+fi
