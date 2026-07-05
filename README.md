@@ -78,17 +78,36 @@ ever included in any API response.
 ## Keeping usage fresh for free (optional)
 
 `claudius refresh` costs one Haiku call per account. But Claude Code already hands
-your **status line** this session's live rate limits for free. If your status line
-script mirrors those into `~/.claude-profiles/<name>/.usage` (format
-`u5 u7 uts r5 r7`), then any account you have a **live session** open for keeps its
-own dashboard card current with **no extra API calls** — keyed off each session's
-config dir, so parallel sessions (the default `~/.claude` plus any
-`CLAUDE_CONFIG_DIR` profiles) each update their own profile. Accounts with no open
-session still need a manual `claudius refresh`.
+your **status line** this session's live rate limits for free, on every render.
+`statusline-usage-cache.js` mirrors those into claudius's cache
+(`~/.claude-profiles/<name>/.usage`, format `u5 u7 uts r5 r7`) so any account you
+have a **live session** open for keeps its own dashboard card current with **no
+extra API calls**. It's keyed off each session's config dir, so parallel sessions
+(the default `~/.claude` plus any `CLAUDE_CONFIG_DIR` profiles) each refresh their
+own profile. Accounts with no open session still need a manual `claudius refresh`.
+
+It's a **pass-through filter**: it reads the status line JSON, writes the cache,
+and re-emits the JSON unchanged — so you chain it in front of your existing status
+line and see no difference. Enable it in `settings.json`:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node ~/.claudius/statusline-usage-cache.js | <your existing statusline command>"
+  }
+}
+```
+
+If you have no status line yet, just the left side works (it warms the cache and
+echoes the JSON). Node ships with Claude Code, so there's nothing to install. The
+filter is best-effort and swallows all errors — it can never slow or break your
+status line.
 
 ## Files
 
 - `claudius` — the CLI/TUI engine (Bash + embedded Ruby)
 - `claude-dashboard.rb` — the localhost dashboard sidecar (Ruby stdlib only)
 - `dashboard.html` — the dashboard page (HTML/CSS/JS), rendered by the sidecar
+- `statusline-usage-cache.js` — optional status-line filter that warms the cache free
 - `install.sh` — portable installer
