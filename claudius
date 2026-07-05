@@ -1332,6 +1332,72 @@ cmd_serve() {
   exec ruby "$dashboard" --root "$PROFILE_ROOT" --script "$script_path" "$@"
 }
 
+# Wire the team status line (statusline.sh next to this script) into Claude Code by
+# stamping "statusLine" into the GLOBAL ~/.claude/settings.json and EVERY profile's
+# settings.json (so parallel CLAUDE_CONFIG_DIR sessions get it too). Idempotent,
+# backs up each file once. `--remove` undoes it (only if it points at our script,
+# so a teammate who kept their own status line is never clobbered).
+cmd_statusline() {
+  local remove=false
+  [[ "${1:-}" == "--remove" ]] && remove=true
+
+  local script_dir sl cmd
+  script_dir="$(dirname "$(resolve_script_path)")"
+  sl="$script_dir/statusline.sh"
+  [[ -f "$sl" ]] || sl="${HOME}/.claudius/statusline.sh"   # fallback to standard clone path
+  if [[ "$remove" != true && ! -f "$sl" ]]; then
+    echo "statusline.sh not found next to claudius ($script_dir)." >&2
+    return 1
+  fi
+  cmd="bash $sl"
+
+  # Targets: the global config plus every stored profile's own settings.json.
+  local targets=("$CLAUDE_DIR/settings.json") n
+  while IFS= read -r n; do
+    [[ -n "$n" ]] && targets+=("$PROFILE_ROOT/$n/settings.json")
+  done < <(list_profiles)
+
+  local t
+  for t in "${targets[@]}"; do
+    ruby - "$t" "$cmd" "$remove" <<'RB'
+require 'json'
+path, cmd, remove = ARGV[0], ARGV[1], (ARGV[2] == "true")
+dir = File.dirname(path)
+exit 0 unless Dir.exist?(dir)            # skip config dirs that don't exist
+data = File.exist?(path) ? (JSON.parse(File.read(path)) rescue {}) : {}
+data = {} unless data.is_a?(Hash)
+changed = false
+if remove
+  sl = data["statusLine"]
+  if sl.is_a?(Hash) && sl["command"].to_s.include?("statusline.sh")
+    data.delete("statusLine"); changed = true    # only remove OUR status line
+  end
+else
+  want = {"type" => "command", "command" => cmd}
+  unless data["statusLine"] == want
+    File.write(path + ".bak", File.read(path)) if File.exist?(path) && !File.exist?(path + ".bak")
+    data["statusLine"] = want
+    changed = true
+  end
+end
+if changed
+  File.write(path, JSON.pretty_generate(data) + "\n")
+  begin; File.chmod(0o600, path); rescue; end
+  puts "  #{remove ? 'removed from' : 'set in'} #{path}"
+else
+  puts "  unchanged #{path}"
+end
+RB
+  done
+
+  if [[ "$remove" == true ]]; then
+    printf '%s✓%s Removed the claudius status line.\n' "$C_GREEN" "$C_RESET"
+  else
+    printf '%s✓%s Status line enabled: %s%s%s\n' "$C_GREEN" "$C_RESET" "$C_DIM" "$cmd" "$C_RESET"
+    printf '%s  Start a new session (or run /statusline) to see it.%s\n' "$C_MUTED" "$C_RESET"
+  fi
+}
+
 cmd_help() {
   local prog; prog="$(basename "$0")"
   cat <<EOF
@@ -1346,11 +1412,14 @@ ${C_MUTED}USAGE${C_RESET}
   $prog add [name]           add a new profile (interactive browser login)
   $prog serve [--port N] [--open]
                              run the localhost dashboard (browser tab)
+  $prog statusline [--remove] enable (or remove) the team status line in Claude Code
   $prog help | -h            show this help
 
 ${C_MUTED}NOTES${C_RESET}
   • --json output is the stable contract consumed by the dashboard.
   • 'add' needs an interactive terminal (browser sign-in); it is CLI-only.
+  • 'statusline' also warms the usage cache for free. Prefer your own status line?
+    Keep just the cache bonus: node ~/.claudius/statusline-usage-cache.js | <yours>
 EOF
 }
 
@@ -1373,6 +1442,7 @@ main() {
     activate)  cmd_activate "$@" ;;
     add)       cmd_add "$@" ;;
     serve)     cmd_serve "$@" ;;
+    statusline) cmd_statusline "$@" ;;
     help|-h|--help) cmd_help ;;
     *)
       echo "Unknown command: $sub" >&2

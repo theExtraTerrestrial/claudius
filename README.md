@@ -47,6 +47,7 @@ claudius activate <profile>   switch the global ~/.claude to <profile>
 claudius add [name]           add a new profile (interactive browser login)
 claudius serve [--port N] [--open]
                               run the localhost dashboard (browser tab)
+claudius statusline [--remove] enable (or remove) the shared status line
 claudius help | -h            show this help
 ```
 
@@ -75,20 +76,30 @@ ever included in any API response.
 - The page markup lives in `dashboard.html` (edit it directly); the sidecar reads
   that file and injects only a CSRF token + the profile root at serve time.
 
-## Keeping usage fresh for free (optional)
+## Status line
 
-`claudius refresh` costs one Haiku call per account. But Claude Code already hands
-your **status line** this session's live rate limits for free, on every render.
-`statusline-usage-cache.js` mirrors those into claudius's cache
-(`~/.claude-profiles/<name>/.usage`, format `u5 u7 uts r5 r7`) so any account you
-have a **live session** open for keeps its own dashboard card current with **no
-extra API calls**. It's keyed off each session's config dir, so parallel sessions
-(the default `~/.claude` plus any `CLAUDE_CONFIG_DIR` profiles) each refresh their
-own profile. Accounts with no open session still need a manual `claudius refresh`.
+Two windows of usage (5h/7d) with reset countdowns, right in your prompt — and a
+free side effect: it **warms the usage cache** so the dashboard stays current with
+**no extra API calls**. (`claudius refresh` costs one Haiku call per account;
+Claude Code hands the status line this session's live limits for free on every
+render.) Cache warming is keyed off each session's config dir, so parallel sessions
+— the default `~/.claude` plus any `CLAUDE_CONFIG_DIR` profiles — each refresh
+their own profile. Accounts with no open session still need a manual
+`claudius refresh`.
 
-It's a **pass-through filter**: it reads the status line JSON, writes the cache,
-and re-emits the JSON unchanged — so you chain it in front of your existing status
-line and see no difference. Enable it in `settings.json`:
+**Option A — use the shared status line** (recommended). Shows `[model] · context ·
+5h/7d`, and includes cache warming. It writes `statusLine` into your global
+`~/.claude/settings.json` and every profile's `settings.json` (backing each up
+once, preserving other keys):
+
+```bash
+claudius statusline           # enable    (or: bash ~/.claudius/install.sh --statusline)
+claudius statusline --remove  # undo (only removes ours — never a status line you set)
+```
+
+**Option B — keep your own status line, take just the cache bonus.** Chain the
+pass-through filter in front of it — it reads the status line JSON, writes the
+cache, and re-emits the JSON unchanged, so you see no difference:
 
 ```json
 {
@@ -99,15 +110,15 @@ line and see no difference. Enable it in `settings.json`:
 }
 ```
 
-If you have no status line yet, just the left side works (it warms the cache and
-echoes the JSON). Node ships with Claude Code, so there's nothing to install. The
-filter is best-effort and swallows all errors — it can never slow or break your
-status line.
+Both are best-effort and swallow all errors — cache writing can never slow or break
+your status line. Node ships with Claude Code, so there's nothing to install. Cache
+format is `u5 u7 uts r5 r7` in `~/.claude-profiles/<name>/.usage`.
 
 ## Files
 
 - `claudius` — the CLI/TUI engine (Bash + embedded Ruby)
 - `claude-dashboard.rb` — the localhost dashboard sidecar (Ruby stdlib only)
 - `dashboard.html` — the dashboard page (HTML/CSS/JS), rendered by the sidecar
-- `statusline-usage-cache.js` — optional status-line filter that warms the cache free
+- `statusline.sh` — the shared status line (usage display + free cache warming)
+- `statusline-usage-cache.js` — filter to warm the cache from your own status line
 - `install.sh` — portable installer

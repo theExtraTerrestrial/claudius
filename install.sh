@@ -24,6 +24,8 @@ usage: $(basename "$0") [--prefix DIR] [--name NAME] [--copy] [--uninstall]
   --name NAME    command name to install   (default: ${CLI_NAME})
   --copy         copy files into DIR instead of symlinking to this checkout
                  (use when this checkout might move or be deleted)
+  --statusline   also enable the team status line in Claude Code (opt-in; edits
+                 ~/.claude + each profile's settings.json, backing them up)
   --uninstall    remove the installed command (and copied dashboard, if any)
   -h, --help     show this help
 EOF
@@ -33,13 +35,15 @@ PREFIX="$DEFAULT_PREFIX"
 NAME="$CLI_NAME"
 COPY=false
 UNINSTALL=false
+STATUSLINE=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --prefix)    PREFIX="${2:?--prefix needs a value}"; shift 2 ;;
-    --name)      NAME="${2:?--name needs a value}"; shift 2 ;;
-    --copy)      COPY=true; shift ;;
-    --uninstall) UNINSTALL=true; shift ;;
-    -h|--help)   usage; exit 0 ;;
+    --prefix)     PREFIX="${2:?--prefix needs a value}"; shift 2 ;;
+    --name)       NAME="${2:?--name needs a value}"; shift 2 ;;
+    --copy)       COPY=true; shift ;;
+    --statusline) STATUSLINE=true; shift ;;
+    --uninstall)  UNINSTALL=true; shift ;;
+    -h|--help)    usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
@@ -139,6 +143,20 @@ case ":$PATH:" in
     fi
     ;;
 esac
+
+# ── Optional: enable the team status line ─────────────────────────────────────
+if [[ "$STATUSLINE" == true ]]; then
+  echo
+  echo "Status line:"
+  # Reuse the CLI's own logic so it stamps the global + every profile settings.json.
+  if bash "$CLI_SRC" statusline 2>&1 | sed 's/^/  /'; then :; else
+    echo "  (could not configure the status line — enable it later with '$NAME statusline')"
+  fi
+else
+  echo
+  echo "Tip: enable the shared status line with '$NAME statusline'"
+  echo "     (or keep your own and just warm the cache — see the README)."
+fi
 
 echo
 echo "Done. Try:  $NAME help"
