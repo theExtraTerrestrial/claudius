@@ -10,10 +10,8 @@ browser. Standardized on **Ruby** (the only non-Bash dependency) so there's no
 Clone the repo and run the installer (macOS + Linux):
 
 ```bash
-git clone https://github.com/OWNER/claudius.git ~/.claudius && bash ~/.claudius/install.sh
+git clone https://github.com/theExtraTerrestrial/claudius.git ~/.claudius && bash ~/.claudius/install.sh
 ```
-
-> Replace `https://github.com/OWNER/claudius.git` with the real repo URL.
 
 Then start a new shell (or `source` your rc) and run `claudius help`.
 

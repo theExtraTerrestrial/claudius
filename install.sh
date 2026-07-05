@@ -3,7 +3,7 @@
 # Installer for the `claudius` CLI (macOS + Linux).
 #
 # Run this from a checkout of the repo:
-#     git clone <repo-url> ~/.claudius && bash ~/.claudius/install.sh
+#     git clone https://github.com/theExtraTerrestrial/claudius.git ~/.claudius && bash ~/.claudius/install.sh
 #
 # By default it SYMLINKS `claudius` into a bin dir on your PATH, pointing at this
 # checkout — so a later `git pull` updates the command with no reinstall. Use
