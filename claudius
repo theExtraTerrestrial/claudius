@@ -251,12 +251,14 @@ end
 
 parts = []
 cache = {}
+resets = {}
 [["5h", "5h"], ["7d", "7d"]].each do |label, key|
   u = h["anthropic-ratelimit-unified-#{key}-utilization"]
   r = h["anthropic-ratelimit-unified-#{key}-reset"]
   p = u.nil? ? nil : pct_int.call(u)
   next if p.nil?
   cache[key] = p
+  resets[key] = r.to_i if r && r.to_s =~ /\A\d+\z/
   tok = "#{label} #{p}%"
   cd = r ? countdown.call(r) : ""
   tok += " (resets #{cd})" unless cd.empty?
@@ -267,9 +269,13 @@ if !cache_path.empty? && (cache.key?("5h") || cache.key?("7d"))
   begin
     dir = File.dirname(cache_path)
     FileUtils.mkdir_p(dir) unless dir.empty?
-    # "-" placeholders keep the three fields positional even when one window
-    # is missing, so `read -r u5 u7 uts` can never shift columns left.
-    File.write(cache_path, "#{cache.fetch('5h', '-')} #{cache.fetch('7d', '-')} #{now.to_i}\n")
+    # Cache line format: "u5 u7 uts r5 r7" — utilization %, cache epoch, then the
+    # 5h/7d reset epochs. "-" placeholders keep every field positional even when a
+    # window is missing, so a positional `read -r u5 u7 uts …` can never shift left.
+    # (Trailing r5/r7 were added later; older 3-field caches still parse fine.)
+    File.write(cache_path,
+      "#{cache.fetch('5h', '-')} #{cache.fetch('7d', '-')} #{now.to_i} " \
+      "#{resets.fetch('5h', '-')} #{resets.fetch('7d', '-')}\n")
     File.chmod(0o600, cache_path)
   rescue
   end
@@ -1149,20 +1155,23 @@ out = []
     sub = (c["claudeAiOauth"] || {})["subscriptionType"] || ""
   rescue
   end
-  u5 = u7 = uts = nil
+  u5 = u7 = uts = r5 = r7 = nil
   begin
     parts = File.read(File.join(dir, ".usage")).strip.split(/\s+/)
     if parts.length >= 3
       u5 = parts[0] == "-" ? nil : parts[0].to_i
       u7 = parts[1] == "-" ? nil : parts[1].to_i
       uts = parts[2].to_i
+      # r5/r7 (reset epochs) are optional trailing fields on newer caches.
+      r5 = parts[3].to_i if parts[3] && parts[3] != "-"
+      r7 = parts[4].to_i if parts[4] && parts[4] != "-"
     end
   rescue
   end
   out << {
     "name" => name, "email" => email, "org" => org, "sub" => sub,
     "active" => (name == active),
-    "u5" => u5, "u7" => u7, "uts" => uts
+    "u5" => u5, "u7" => u7, "uts" => uts, "r5" => r5, "r7" => r7
   }
 end
 puts JSON.generate(out)

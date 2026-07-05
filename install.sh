@@ -59,20 +59,24 @@ resolve_dir() {
 SRC_DIR="$(resolve_dir)"
 CLI_SRC="$SRC_DIR/claudius"
 DASH_SRC="$SRC_DIR/claude-dashboard.rb"
+HTML_SRC="$SRC_DIR/dashboard.html"
 TARGET="$PREFIX/$NAME"
 
 if [[ "$UNINSTALL" == true ]]; then
   removed=false
   [[ -e "$TARGET" || -L "$TARGET" ]] && { rm -f "$TARGET"; echo "Removed $TARGET"; removed=true; }
-  if [[ -f "$PREFIX/claude-dashboard.rb" && ! -L "$PREFIX/claude-dashboard.rb" ]]; then
-    rm -f "$PREFIX/claude-dashboard.rb"; echo "Removed $PREFIX/claude-dashboard.rb"; removed=true
-  fi
+  # Remove sidecar files copied by a --copy install (never symlink sources).
+  for extra in claude-dashboard.rb dashboard.html; do
+    if [[ -f "$PREFIX/$extra" && ! -L "$PREFIX/$extra" ]]; then
+      rm -f "$PREFIX/$extra"; echo "Removed $PREFIX/$extra"; removed=true
+    fi
+  done
   [[ "$removed" == true ]] || echo "Nothing to remove at $TARGET"
   exit 0
 fi
 
 # ── Preconditions ─────────────────────────────────────────────────────────────
-for f in "$CLI_SRC" "$DASH_SRC"; do
+for f in "$CLI_SRC" "$DASH_SRC" "$HTML_SRC"; do
   [[ -f "$f" ]] || { echo "error: missing file: $f" >&2; exit 1; }
 done
 if ! command -v ruby >/dev/null 2>&1; then
@@ -86,10 +90,13 @@ chmod +x "$CLI_SRC" 2>/dev/null || true
 # ── Install ───────────────────────────────────────────────────────────────────
 if [[ "$COPY" == true ]]; then
   cp "$CLI_SRC" "$TARGET"
-  cp "$DASH_SRC" "$PREFIX/claude-dashboard.rb"   # sibling lookup finds it next to $TARGET
+  # Sidecar files must sit next to $TARGET so the CLI/dashboard find them by name.
+  cp "$DASH_SRC" "$PREFIX/claude-dashboard.rb"
+  cp "$HTML_SRC" "$PREFIX/dashboard.html"
   chmod +x "$TARGET"
   echo "Installed (copy):    $TARGET"
   echo "                     $PREFIX/claude-dashboard.rb"
+  echo "                     $PREFIX/dashboard.html"
 else
   ln -sfn "$CLI_SRC" "$TARGET"
   echo "Installed (symlink): $TARGET -> $CLI_SRC"
@@ -101,10 +108,21 @@ case ":$PATH:" in
     echo "PATH:                $PREFIX already on PATH ✓"
     ;;
   *)
+    # Pick the shell rc to update. Prefer the login shell in $SHELL (zsh on modern
+    # macOS, usually bash on Linux); if that's unset/unrecognized, fall back to
+    # whichever rc already exists — zsh first, since macOS defaults to zsh.
     rc=""
     case "$(basename "${SHELL:-}")" in
       zsh)  rc="$HOME/.zshrc" ;;
       bash) [[ "$(uname)" == "Darwin" ]] && rc="$HOME/.bash_profile" || rc="$HOME/.bashrc" ;;
+      *)
+        if   [[ -f "$HOME/.zshrc" ]];        then rc="$HOME/.zshrc"
+        elif [[ -f "$HOME/.bashrc" ]];       then rc="$HOME/.bashrc"
+        elif [[ -f "$HOME/.bash_profile" ]]; then rc="$HOME/.bash_profile"
+        elif [[ "$(uname)" == "Darwin" ]];   then rc="$HOME/.zshrc"   # mac default shell
+        else rc="$HOME/.profile"
+        fi
+        ;;
     esac
     line="export PATH=\"$PREFIX:\$PATH\""
     if [[ -n "$rc" ]]; then

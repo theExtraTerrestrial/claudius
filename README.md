@@ -59,13 +59,36 @@ claudius serve --open
 ```
 
 Serves a self-contained page on `127.0.0.1` **only** (never the LAN) with a card
-per account: identity, subscription badge, 5h/7d usage bars, cache age, and
-per-card **Refresh** / **Activate** buttons. Mutations shell back into the CLI so
-the terminal and the dashboard always agree. No account tokens are ever included
-in any API response.
+per account: identity, subscription badge, 5h/7d usage bars, **reset times**,
+cache age, and per-card **Refresh** / **Activate** buttons. Mutations shell back
+into the CLI so the terminal and the dashboard always agree. No account tokens are
+ever included in any API response.
+
+- **Reset times** show under each usage bar. Click any reset line (or the
+  **reset:** button in the toolbar) to cycle how it is displayed: live
+  **countdown** → absolute **clock** → **total** remaining. The choice is
+  remembered in the browser.
+- **Refresh is not free.** Each **Refresh** / **Refresh all** spends a small Haiku
+  API call (and may renew a token) to read live limits — the dashboard says so.
+  **Auto-poll** only re-reads the local cache, which is free; it never refreshes on
+  a timer.
+- The page markup lives in `dashboard.html` (edit it directly); the sidecar reads
+  that file and injects only a CSRF token + the profile root at serve time.
+
+## Keeping usage fresh for free (optional)
+
+`claudius refresh` costs one Haiku call per account. But Claude Code already hands
+your **status line** this session's live rate limits for free. If your status line
+script mirrors those into `~/.claude-profiles/<name>/.usage` (format
+`u5 u7 uts r5 r7`), then any account you have a **live session** open for keeps its
+own dashboard card current with **no extra API calls** — keyed off each session's
+config dir, so parallel sessions (the default `~/.claude` plus any
+`CLAUDE_CONFIG_DIR` profiles) each update their own profile. Accounts with no open
+session still need a manual `claudius refresh`.
 
 ## Files
 
 - `claudius` — the CLI/TUI engine (Bash + embedded Ruby)
 - `claude-dashboard.rb` — the localhost dashboard sidecar (Ruby stdlib only)
+- `dashboard.html` — the dashboard page (HTML/CSS/JS), rendered by the sidecar
 - `install.sh` — portable installer
