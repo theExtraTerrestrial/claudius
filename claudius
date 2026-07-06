@@ -854,6 +854,30 @@ activate_profile() {
   printf '%s  export CLAUDE_CONFIG_DIR=%q%s\n' "$C_DIM" "$source_dir" "$C_RESET"
 }
 
+# Delete a stored profile (its whole config dir: credentials, identity, usage
+# cache, backups). Deliberately does NOT touch the live session — on macOS the
+# credential lives in the shared Keychain and on Linux in ~/.claude, neither of
+# which we clear here; removing a stored profile just forgets claudius's saved
+# copy, it never logs you out. If the removed profile was the recorded active one,
+# clear the .active_profile marker so nothing points at a now-missing dir. No
+# prompting here — callers confirm.
+remove_profile() {
+  local name="$1"
+  local dir="$PROFILE_ROOT/$name"
+  if [[ ! -d "$dir" ]]; then
+    echo "Profile '$name' does not exist." >&2
+    return 1
+  fi
+  # Guard against a malformed name resolving outside the profile root.
+  case "$name" in
+    ""|*/*|.|..) echo "Refusing to remove invalid profile name '$name'." >&2; return 1 ;;
+  esac
+  rm -rf "$dir"
+  local active; active="$(get_active_profile || true)"
+  [[ "$active" == "$name" ]] && rm -f "$ACTIVE_PROFILE_FILE"
+  return 0
+}
+
 # ── Menu data + rendering ─────────────────────────────────────────────────────
 build_profile_meta() {
   P_EMAIL=(); P_ORG=(); P_SUB=(); P_U5=(); P_U7=(); P_UTS=()
@@ -1017,6 +1041,7 @@ render_menu() {
   fi
   local keybar="  ${C_KEY}↑↓${C_RESET}${C_MUTED} move   ${C_RESET}${C_KEY}⏎${C_RESET}${C_MUTED} select   ${C_RESET}"
   (( profile_count > 0 )) && keybar+="${C_KEY}r${C_RESET}${C_MUTED} refresh usage   ${C_RESET}"
+  (( profile_count > 0 )) && keybar+="${C_KEY}d${C_RESET}${C_MUTED} remove   ${C_RESET}"
   keybar+="${C_KEY}a${C_RESET}${C_MUTED} add   ${C_RESET}${C_KEY}q${C_RESET}${C_MUTED} quit${C_RESET}"
   add "$keybar"
 
@@ -1183,6 +1208,37 @@ show_menu() {
             printf '\r  %s⚠ could not refresh %s (sign in again to renew its token)%s%*s' \
               "$C_AMBER" "$rname" "$C_RESET" 12 ''
             sleep 1.8
+          fi
+        fi
+        ;;
+      d|D)
+        # Remove the selected profile (only when a profile row is selected).
+        if (( profile_count > 0 && selected_index < profile_count )); then
+          local dname="${PROFILES[$selected_index]}"
+          render_menu "$active_profile" "$selected_index" "$profile_count"
+          local extra=""
+          [[ "$dname" == "$active_profile" ]] && extra=" (active — your live session stays signed in)"
+          printf '\r  %sRemove %s%s? Deletes its stored credentials. [y/N]%s ' \
+            "$C_AMBER" "$dname" "$extra" "$C_RESET"
+          local dk; read_key dk || dk=""
+          if [[ "$dk" == "y" || "$dk" == "Y" ]]; then
+            remove_profile "$dname" || true
+            # Rebuild the in-memory profile list + indices to reflect the deletion.
+            PROFILES=()
+            local p
+            while IFS= read -r p; do [[ -n "$p" ]] && PROFILES+=("$p"); done < <(list_profiles)
+            build_profile_meta
+            active_profile="$(get_active_profile || true)"
+            profile_count=${#PROFILES[@]}
+            add_idx=$(( profile_count ))
+            quit_idx=$(( profile_count + 1 ))
+            # Keep the cursor on a real profile row when one still exists.
+            if (( profile_count > 0 && selected_index >= profile_count )); then
+              selected_index=$(( profile_count - 1 ))
+            fi
+            (( selected_index > quit_idx )) && selected_index=$quit_idx
+            (( selected_index < 0 )) && selected_index=0
+            clear_screen
           fi
         fi
         ;;
@@ -1491,6 +1547,34 @@ cmd_activate() {
   activate_profile "$name"
 }
 
+cmd_remove() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: $(basename "$0") remove <profile>" >&2
+    return 2
+  fi
+  if [[ ! -d "$PROFILE_ROOT/$name" ]]; then
+    echo "Profile '$name' does not exist." >&2
+    return 1
+  fi
+  local active; active="$(get_active_profile || true)"
+  local warn=""
+  [[ "$active" == "$name" ]] && warn=" (currently active)"
+  printf "%sRemove profile '%s'%s?%s This deletes its stored credentials. [y/N] " \
+    "$C_AMBER" "$name" "$warn" "$C_RESET"
+  local ans; IFS= read -r ans || ans=""
+  if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
+    echo "Cancelled."
+    return 1
+  fi
+  remove_profile "$name" || return 1
+  printf '%s✓%s Removed profile %s%s%s.\n' "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
+  if [[ "$active" == "$name" ]]; then
+    printf '%s  Your live Claude session is unchanged — this only forgot the saved profile.%s\n' \
+      "$C_MUTED" "$C_RESET"
+  fi
+}
+
 # CLI add: interactive browser login, but plain terminal I/O (no alt-screen / raw
 # mode). Accepts an optional name argument, otherwise prompts on the plain tty.
 cmd_add() {
@@ -1656,6 +1740,7 @@ ${C_MUTED}USAGE${C_RESET}
   $prog refresh <profile>    renew token if needed & rewrite the usage cache
   $prog activate <profile>   switch the global ~/.claude to <profile>
   $prog add [name]           add a new profile (interactive browser login)
+  $prog remove <profile>     delete a stored profile (does not sign you out)
   $prog serve [--port N] [--open]
                              run the localhost dashboard (browser tab)
   $prog statusline [--remove] enable (or remove) the team status line in Claude Code
@@ -1687,6 +1772,7 @@ main() {
     refresh)   cmd_refresh "$@" ;;
     activate)  cmd_activate "$@" ;;
     add)       cmd_add "$@" ;;
+    remove|rm|delete) cmd_remove "$@" ;;
     serve)     cmd_serve "$@" ;;
     statusline) cmd_statusline "$@" ;;
     help|-h|--help) cmd_help ;;
