@@ -9,6 +9,9 @@ PROFILE_ROOT="${HOME}/.claude-profiles"
 ACTIVE_PROFILE_FILE="${PROFILE_ROOT}/.active_profile"
 CLAUDE_DIR="${HOME}/.claude"
 CLAUDE_CONFIG="${HOME}/.claude.json"
+# macOS stores the Claude Code OAuth credential in the login Keychain under this
+# service name (account = the macOS user), not in a .credentials.json file.
+KEYCHAIN_SERVICE="Claude Code-credentials"
 RAW_MODE_ENABLED=false
 ALT_SCREEN_ACTIVE=false
 
@@ -179,10 +182,69 @@ file_mtime() {
   stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
 
+# ── macOS Keychain bridge ─────────────────────────────────────────────────────
+# On macOS, `claude auth login` stores the OAuth credential JSON in the login
+# Keychain (service "$KEYCHAIN_SERVICE", account = the macOS user), NOT in a
+# .credentials.json file — and CLAUDE_CONFIG_DIR does NOT redirect it: every config
+# dir shares that one Keychain item. So on macOS we bridge the Keychain by hand:
+# capture the token out of it after a login, and push a profile's token back into
+# it on activation. On Linux (no `security`) these are no-ops and the plain
+# .credentials.json file path is used throughout.
+keychain_available() {
+  [[ "$(uname 2>/dev/null)" == "Darwin" ]] && command -v security >/dev/null 2>&1
+}
+
+keychain_account() { printf '%s' "${USER:-$(id -un 2>/dev/null || echo "")}"; }
+
+# Dump the live Keychain credential JSON to stdout (nonzero/empty if absent).
+read_keychain_creds() {
+  keychain_available || return 1
+  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$(keychain_account)" -w 2>/dev/null
+}
+
+# Replace the live Keychain credential with the JSON in file $1 (-U updates the
+# existing item in place). Passing -w on the command line is the only scriptable
+# form `security` offers; the value is briefly visible to `ps`, an acceptable
+# tradeoff for a local tool. Nonzero if the Keychain is unavailable or write fails.
+write_keychain_creds() {
+  local src="$1" json
+  keychain_available || return 1
+  [[ -f "$src" ]] || return 1
+  json="$(cat "$src" 2>/dev/null)" || return 1
+  [[ -n "$json" ]] || return 1
+  security add-generic-password -U \
+    -s "$KEYCHAIN_SERVICE" -a "$(keychain_account)" -w "$json" >/dev/null 2>&1
+}
+
+# After an isolated `claude auth login`, guarantee the profile dir has a
+# .credentials.json. On macOS the freshly minted token lives only in the Keychain,
+# so pull it out and write it into the profile (0600). No-op when the file already
+# exists (Linux) or the Keychain has nothing.
+materialize_profile_credentials() {
+  local dir="$1" creds json
+  creds="$dir/.credentials.json"
+  [[ -f "$creds" ]] && return 0
+  keychain_available || return 1
+  json="$(read_keychain_creds)" || return 1
+  [[ -n "$json" ]] || return 1
+  printf '%s' "$json" > "$creds"
+  chmod 600 "$creds" 2>/dev/null || true
+  [[ -s "$creds" ]]
+}
+
 # ── Credentials / usage probing ───────────────────────────────────────────────
 # Read the OAuth access token from a credentials file (defaults to the live one).
 get_access_token() {
   local creds_file="${1:-${CLAUDE_DIR}/.credentials.json}"
+  # When asked for the LIVE credential (no explicit file arg) and no file exists,
+  # fall back to the macOS Keychain — that's where the live token actually lives.
+  # Parse straight from the Keychain JSON so nothing is written to disk.
+  if [[ $# -eq 0 && ! -f "$creds_file" ]] && keychain_available; then
+    local kc; kc="$(read_keychain_creds)"
+    [[ -n "$kc" ]] || return 1
+    printf '%s' "$kc" | ruby -rjson -e 'begin; d=JSON.parse(STDIN.read); rescue; exit 0; end; puts(d.fetch("claudeAiOauth",{}).fetch("accessToken","")||"")'
+    return 0
+  fi
   [[ -f "$creds_file" ]] || return 1
   ruby - "$creds_file" <<'RB'
 require 'json'
@@ -593,7 +655,15 @@ save_current_profile() {
 
   mkdir -p "$target_dir"
 
-  if [[ -f "$CLAUDE_DIR/.credentials.json" ]]; then
+  # Capture the live credential. On macOS the source of truth is the Keychain
+  # (kept fresh by the CLI); elsewhere it's the global .credentials.json file.
+  if keychain_available; then
+    local json; json="$(read_keychain_creds)"
+    if [[ -n "$json" ]]; then
+      printf '%s' "$json" > "$target_dir/.credentials.json"
+      chmod 600 "$target_dir/.credentials.json" 2>/dev/null || true
+    fi
+  elif [[ -f "$CLAUDE_DIR/.credentials.json" ]]; then
     cp "$CLAUDE_DIR/.credentials.json" "$target_dir/.credentials.json"
     chmod 600 "$target_dir/.credentials.json" 2>/dev/null || true
   fi
@@ -632,6 +702,9 @@ activate_profile() {
   mkdir -p "$CLAUDE_DIR"
   cp "$source_dir/.credentials.json" "$CLAUDE_DIR/.credentials.json"
   chmod 600 "$CLAUDE_DIR/.credentials.json" 2>/dev/null || true
+  # macOS reads the live token from the Keychain, not this file — push it in so a
+  # bare `claude` (and any CLAUDE_CONFIG_DIR session) uses the activated account.
+  write_keychain_creds "$source_dir/.credentials.json" || true
   local id_file
   id_file="$(profile_identity_path "$source_dir")"
   if [[ -f "$id_file" ]]; then
@@ -1122,8 +1195,17 @@ add_new_profile() {
   echo "Complete the sign-in in your browser or terminal prompt."
   echo
 
-  if CLAUDE_CONFIG_DIR="$target_dir" claude auth login \
-     && credentials_ready "$target_dir/.credentials.json"; then
+  # Log in, then confirm credentials were captured. On macOS the freshly minted
+  # token lands only in the login Keychain — CLAUDE_CONFIG_DIR does not redirect it —
+  # so materialize it into the profile dir before the check. Otherwise a perfectly
+  # good sign-in (e.g. an auto-completed browser session) reads as failure and the
+  # profile is discarded.
+  local login_ok=false
+  if CLAUDE_CONFIG_DIR="$target_dir" claude auth login; then
+    materialize_profile_credentials "$target_dir" || true
+    credentials_ready "$target_dir/.credentials.json" && login_ok=true
+  fi
+  if [[ "$login_ok" == true ]]; then
     chmod 600 "$target_dir/.credentials.json" 2>/dev/null || true
     [[ -f "$target_dir/.claude.json" ]] && chmod 600 "$target_dir/.claude.json" 2>/dev/null || true
     # A fresh login leaves onboarding "incomplete"; stamp it so the dir is usable
@@ -1308,8 +1390,14 @@ cmd_add() {
   echo "Complete the sign-in in your browser or terminal prompt."
   echo
 
-  if CLAUDE_CONFIG_DIR="$target_dir" claude auth login \
-     && credentials_ready "$target_dir/.credentials.json"; then
+  # See add_new_profile: on macOS the token lands only in the Keychain, so pull it
+  # into the profile dir before treating the sign-in as complete.
+  local login_ok=false
+  if CLAUDE_CONFIG_DIR="$target_dir" claude auth login; then
+    materialize_profile_credentials "$target_dir" || true
+    credentials_ready "$target_dir/.credentials.json" && login_ok=true
+  fi
+  if [[ "$login_ok" == true ]]; then
     chmod 600 "$target_dir/.credentials.json" 2>/dev/null || true
     [[ -f "$target_dir/.claude.json" ]] && chmod 600 "$target_dir/.claude.json" 2>/dev/null || true
     normalize_profile_identity "$new_name"
