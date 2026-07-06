@@ -12,6 +12,12 @@ CLAUDE_CONFIG="${HOME}/.claude.json"
 RAW_MODE_ENABLED=false
 ALT_SCREEN_ACTIVE=false
 
+# Fractional `read -t` timeouts need bash >= 4. Apple ships bash 3.2, whose `read`
+# only accepts an INTEGER timeout ("invalid timeout specification" otherwise). Fall
+# back to 1s there: a lone ESC waits up to 1s, but arrow-key escape sequences arrive
+# as a burst already sitting in the tty buffer, so they still read instantly.
+if (( BASH_VERSINFO[0] >= 4 )); then ESC_SEQ_TIMEOUT=0.05; else ESC_SEQ_TIMEOUT=1; fi
+
 # Marker glyphs (single-column unicode — safe on any modern terminal).
 GLYPH_ACTIVE='●'
 GLYPH_POINTER='➜'
@@ -164,6 +170,13 @@ fmt_age() {
   elif (( diff < 3600 )); then printf '%dm ago' $(( diff / 60 ))
   elif (( diff < 86400 )); then printf '%dh ago' $(( diff / 3600 ))
   else printf '%dd ago' $(( diff / 86400 )); fi
+}
+
+# Modification time (epoch) of a file, portable across GNU and BSD/macOS `stat`.
+# GNU uses `-c %Y`; BSD uses `-f %m`. `-c` errors as an illegal option on BSD, so
+# the `||` falls through to `-f`; on GNU `-c` succeeds and `-f` is never reached.
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
 }
 
 # ── Credentials / usage probing ───────────────────────────────────────────────
@@ -346,9 +359,9 @@ refresh_profile_usage() {
   [[ -n "$ptoken" ]] || return 1
 
   local before after
-  before="$(stat -c %Y "$cache_path" 2>/dev/null || echo 0)"
+  before="$(file_mtime "$cache_path")"
   fetch_usage "$ptoken" "$cache_path" >/dev/null 2>&1 || true
-  after="$(stat -c %Y "$cache_path" 2>/dev/null || echo 0)"
+  after="$(file_mtime "$cache_path")"
   [[ "$after" != "$before" ]]
 }
 
@@ -470,7 +483,15 @@ ensure_storage() {
 }
 
 list_profiles() {
-  find "$PROFILE_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' 2>/dev/null | sort
+  # Pure-shell directory listing — BSD/macOS `find` has no `-printf`. The `*/` glob
+  # skips dotfiles by default; when there are no profile dirs the glob stays literal
+  # and the `-d` test drops it, so nothing is printed.
+  local d
+  for d in "$PROFILE_ROOT"/*/; do
+    [[ -d "$d" ]] || continue
+    d="${d%/}"
+    printf '%s\n' "${d##*/}"
+  done | sort
 }
 
 get_active_profile() {
@@ -799,53 +820,57 @@ render_menu() {
   unset -f emit_line
 }
 
+# Read one key (or a full arrow-key escape sequence) into the variable NAMED by $1.
+# Uses `printf -v` rather than a bash-4.3 `local -n` nameref so it runs on bash 3.2
+# (macOS) too; dynamic scoping means the caller's local is visible to set here.
 read_key() {
-  local -n output_ref="$1"
+  local __out="$1"
   local char
   local seq1
   local seq2
+  local nl=$'\n'
 
   if ! IFS= read -r -s -n 1 char; then
-    output_ref=""
+    printf -v "$__out" '%s' ""
     return 1
   fi
 
   if [[ -z "$char" ]]; then
-    output_ref=$'\n'
+    printf -v "$__out" '%s' "$nl"
     return 0
   fi
 
   if [[ "$char" == $'\n' || "$char" == $'\r' ]]; then
-    output_ref=$'\n'
+    printf -v "$__out" '%s' "$nl"
     return 0
   fi
 
   if [[ "$char" == $'\e' ]]; then
-    if IFS= read -r -s -n 1 -t 0.05 seq1; then
+    if IFS= read -r -s -n 1 -t "$ESC_SEQ_TIMEOUT" seq1; then
       case "$seq1" in
         '['|'O')
-          if IFS= read -r -s -n 1 -t 0.05 seq2; then
+          if IFS= read -r -s -n 1 -t "$ESC_SEQ_TIMEOUT" seq2; then
             case "$seq2" in
               A|B|C|D)
-                output_ref="$char$seq1$seq2"
+                printf -v "$__out" '%s' "$char$seq1$seq2"
                 ;;
               *)
-                output_ref="$char"
+                printf -v "$__out" '%s' "$char"
                 ;;
             esac
           else
-            output_ref="$char"
+            printf -v "$__out" '%s' "$char"
           fi
           ;;
         *)
-          output_ref="$char"
+          printf -v "$__out" '%s' "$char"
           ;;
       esac
     else
-      output_ref="$char"
+      printf -v "$__out" '%s' "$char"
     fi
   else
-    output_ref="$char"
+    printf -v "$__out" '%s' "$char"
   fi
 
   return 0
@@ -996,18 +1021,18 @@ credentials_ready() {
 
 prompt_for_profile_name() {
   local prompt_text="$1"
-  local -n output_ref="$2"
+  local __out="$2"   # name of the caller's output var (set via printf -v; bash-3.2 safe)
   local input=""
   local key
 
   show_cursor  # text entry — cursor is wanted here
   printf '%s' "$prompt_text"
-  trap 'trap - INT; printf "\n"; output_ref=""; return 3' INT
+  trap 'trap - INT; printf "\n"; printf -v "$__out" "%s" ""; return 3' INT
 
   while true; do
     if ! read_key key; then
       trap - INT
-      output_ref=""
+      printf -v "$__out" '%s' ""
       return 1
     fi
 
@@ -1015,13 +1040,13 @@ prompt_for_profile_name() {
       $'\e')
         trap - INT
         printf '\n'
-        output_ref=""
+        printf -v "$__out" '%s' ""
         return 2
         ;;
       $'\n'|$'\r')
         trap - INT
         printf '\n'
-        output_ref="$input"
+        printf -v "$__out" '%s' "$input"
         return 0
         ;;
       $'\177'|$'\b')
