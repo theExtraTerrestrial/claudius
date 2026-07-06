@@ -12,6 +12,12 @@ CLAUDE_CONFIG="${HOME}/.claude.json"
 # macOS stores the Claude Code OAuth credential in the login Keychain under this
 # service name (account = the macOS user), not in a .credentials.json file.
 KEYCHAIN_SERVICE="Claude Code-credentials"
+# Claude Code's public OAuth token endpoint + client id, used to refresh a stored
+# profile's token directly (see oauth_refresh_creds). These mirror the CLI's own
+# values; if Anthropic ever rotates them a refresh simply 401s and degrades to
+# "sign in again", so a drift here is graceful, not fatal.
+OAUTH_TOKEN_URL="https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 RAW_MODE_ENABLED=false
 ALT_SCREEN_ACTIVE=false
 
@@ -216,6 +222,30 @@ write_keychain_creds() {
     -s "$KEYCHAIN_SERVICE" -a "$(keychain_account)" -w "$json" >/dev/null 2>&1
 }
 
+# The email of the account currently LIVE in the shared macOS Keychain session.
+# This — not claudius's .active_profile marker — is what determines whose token a
+# refresh would rotate. Prefer `claude auth status` (authoritative for the live
+# token), fall back to the ~/.claude.json identity snapshot. Empty if unknown.
+live_account_email() {
+  keychain_available || return 0
+  local email=""
+  local st; st="$(claude auth status 2>/dev/null || true)"
+  if [[ -n "$st" ]]; then
+    email="$(printf '%s' "$st" | ruby -rjson -e 'begin; d=JSON.parse(STDIN.read); rescue; exit 0; end; puts(d["email"]||d["user"]||"")' 2>/dev/null)"
+  fi
+  if [[ -z "$email" && -f "$CLAUDE_CONFIG" ]]; then
+    email="$(ruby -rjson -e 'begin; d=JSON.parse(File.read(ARGV[0])); rescue; exit 0; end; puts((d["oauthAccount"]||{})["emailAddress"]||"")' "$CLAUDE_CONFIG" 2>/dev/null)"
+  fi
+  printf '%s' "$email"
+}
+
+# The email a stored profile is bound to (from its identity file). Empty if unknown.
+profile_account_email() {
+  local idf; idf="$(profile_identity_path "$PROFILE_ROOT/$1")"
+  [[ -f "$idf" ]] || return 0
+  ruby -rjson -e 'begin; d=JSON.parse(File.read(ARGV[0])); rescue; exit 0; end; puts((d["oauthAccount"]||{})["emailAddress"]||"")' "$idf" 2>/dev/null
+}
+
 # After an isolated `claude auth login`, guarantee the profile dir has a
 # .credentials.json. On macOS the freshly minted token lives only in the Keychain,
 # so pull it out and write it into the profile (0600). No-op when the file already
@@ -236,14 +266,16 @@ materialize_profile_credentials() {
 # Read the OAuth access token from a credentials file (defaults to the live one).
 get_access_token() {
   local creds_file="${1:-${CLAUDE_DIR}/.credentials.json}"
-  # When asked for the LIVE credential (no explicit file arg) and no file exists,
-  # fall back to the macOS Keychain — that's where the live token actually lives.
-  # Parse straight from the Keychain JSON so nothing is written to disk.
-  if [[ $# -eq 0 && ! -f "$creds_file" ]] && keychain_available; then
+  # For the LIVE credential (no explicit file arg) on macOS, read the Keychain
+  # first: it is the source of truth the CLI keeps fresh, whereas the ~/.claude
+  # file is only a snapshot written at activation time and can be stale. Parse
+  # straight from the Keychain JSON so nothing is written to disk.
+  if [[ $# -eq 0 ]] && keychain_available; then
     local kc; kc="$(read_keychain_creds)"
-    [[ -n "$kc" ]] || return 1
-    printf '%s' "$kc" | ruby -rjson -e 'begin; d=JSON.parse(STDIN.read); rescue; exit 0; end; puts(d.fetch("claudeAiOauth",{}).fetch("accessToken","")||"")'
-    return 0
+    if [[ -n "$kc" ]]; then
+      printf '%s' "$kc" | ruby -rjson -e 'begin; d=JSON.parse(STDIN.read); rescue; exit 0; end; puts(d.fetch("claudeAiOauth",{}).fetch("accessToken","")||"")'
+      return 0
+    fi
   fi
   [[ -f "$creds_file" ]] || return 1
   ruby - "$creds_file" <<'RB'
@@ -377,14 +409,92 @@ exit(exp && exp / 1000.0 > Time.now.to_f + 60 ? 1 : 0)
 RB
 }
 
-# Ask the Claude CLI to mint a fresh OAuth token for a stored profile. Pointing the
-# CLI at the profile's config dir and making one cheap authenticated request lets it
-# transparently refresh an expired access token (via the stored refreshToken) and
-# write the new credentials straight back into the profile dir. Returns 0 if the
-# stored token is fresh afterwards. Costs one tiny Haiku call — only invoked when
-# the stored token is actually expired.
+# Refresh the OAuth token in a profile's credentials file DIRECTLY via the token
+# endpoint, using its stored refresh token. This touches neither the Keychain nor
+# the live account, so it safely refreshes a NON-ACTIVE profile — something the
+# CLI-based refresh cannot do on macOS, where every config dir shares one Keychain
+# item and `claude` only ever refreshes whatever is currently live. Refresh tokens
+# rotate, so the new refresh token is persisted next to the new access token.
+# Returns 0 only when the file ends up with a fresh (unexpired) token.
+oauth_refresh_creds() {
+  local creds="$1"
+  [[ -f "$creds" ]] || return 1
+  ruby - "$creds" "$OAUTH_TOKEN_URL" "$OAUTH_CLIENT_ID" <<'RB'
+require 'json'
+require 'net/http'
+require 'uri'
+
+path, token_url, client_id = ARGV[0], ARGV[1], ARGV[2]
+begin
+  data = JSON.parse(File.read(path))
+rescue
+  exit 1
+end
+oauth = data["claudeAiOauth"]
+exit 1 unless oauth.is_a?(Hash)
+refresh = oauth["refreshToken"].to_s
+exit 1 if refresh.empty?
+scopes = oauth["scopes"]
+scope = (scopes.is_a?(Array) && !scopes.empty?) ? scopes.join(" ") : "user:inference user:profile"
+
+begin
+  uri = URI(token_url)
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = true
+  http.open_timeout = 15
+  http.read_timeout = 15
+  req = Net::HTTP::Post.new(uri)
+  req['Content-Type'] = 'application/json'
+  req['anthropic-beta'] = 'oauth-2025-04-20'
+  req.body = JSON.generate(
+    "grant_type" => "refresh_token",
+    "refresh_token" => refresh,
+    "client_id" => client_id,
+    "scope" => scope
+  )
+  resp = http.request(req)
+rescue
+  exit 1
+end
+exit 1 unless resp.is_a?(Net::HTTPSuccess)
+begin
+  body = JSON.parse(resp.body)
+rescue
+  exit 1
+end
+at = body["access_token"].to_s
+exit 1 if at.empty?
+
+oauth["accessToken"] = at
+oauth["refreshToken"] = body["refresh_token"] unless body["refresh_token"].to_s.empty?
+oauth["expiresAt"] = ((Time.now.to_f + body["expires_in"].to_i) * 1000).to_i if body["expires_in"]
+oauth["scopes"] = body["scope"].split(" ") if body["scope"] && !body["scope"].to_s.empty?
+data["claudeAiOauth"] = oauth
+
+begin
+  tmp = path + ".tmp"
+  File.write(tmp, JSON.generate(data))
+  File.chmod(0o600, tmp)
+  File.rename(tmp, path)
+rescue
+  exit 1
+end
+exit 0
+RB
+}
+
+# Mint a fresh OAuth token for a stored profile whose token has expired. On macOS
+# we refresh directly against the token endpoint (oauth_refresh_creds) so a
+# non-active profile can be renewed without disturbing the live Keychain account.
+# Elsewhere we point the CLI at the profile's config dir and make one cheap
+# authenticated request, which transparently refreshes the token and writes the new
+# credentials back into the dir. Returns 0 if the stored token is fresh afterwards.
 refresh_profile_token() {
   local name="$1" dir="$PROFILE_ROOT/$name"
+  if keychain_available; then
+    oauth_refresh_creds "$dir/.credentials.json"
+    return
+  fi
   command -v claude >/dev/null 2>&1 || return 1
   local runner=(claude -p "hi" --model claude-haiku-4-5-20251001)
   if command -v timeout >/dev/null 2>&1; then
@@ -395,10 +505,17 @@ refresh_profile_token() {
   [[ -f "$dir/.credentials.json" ]] && ! token_expired "$dir/.credentials.json"
 }
 
-# Refresh one profile's usage cache. Getting a WORKING token is the crux: stored
-# profile tokens go stale (they're only as fresh as the last activation), so we
-#   • use the live ~/.claude token for the active profile (the CLI keeps it fresh),
-#   • otherwise let the CLI refresh the profile's stored token when it's expired.
+# Refresh one profile's usage cache. Getting a WORKING token is the crux, and the
+# hard constraint is DON'T rotate the token of the account that's currently live —
+# OAuth refresh tokens are single-use and rotate server-side, so refreshing a
+# profile that shares the live session's account invalidates that live session
+# (a logout). Strategy:
+#   • macOS: the live account is whatever is in the shared Keychain, NOT whatever
+#     claudius's .active_profile says. If the profile's account == the live account,
+#     read the fresh token straight from the Keychain (no rotation). Only a profile
+#     bound to a DIFFERENT account is refreshed directly against the token endpoint.
+#   • Linux: use the live ~/.claude token for the active profile; otherwise let the
+#     CLI refresh the profile's stored token in its own config dir.
 # Returns 0 ONLY if the cache was actually rewritten (detected via mtime) — the old
 # implementation returned 0 whenever the stale cache file merely existed, which made
 # a silent 401 look like a successful refresh.
@@ -409,15 +526,31 @@ refresh_profile_usage() {
   local creds="$dir/.credentials.json"
 
   local active; active="$(get_active_profile || true)"
-  if [[ "$name" == "$active" && -f "$CLAUDE_DIR/.credentials.json" ]] \
-     && ! token_expired "$CLAUDE_DIR/.credentials.json"; then
-    creds="$CLAUDE_DIR/.credentials.json"
-  elif token_expired "$creds"; then
-    refresh_profile_token "$name" || true
-    creds="$dir/.credentials.json"
+  local ptoken=""
+  if keychain_available; then
+    # macOS: decide by the LIVE account identity, not the .active_profile marker.
+    local live pemail; live="$(live_account_email)"; pemail="$(profile_account_email "$name")"
+    if [[ -n "$live" && -n "$pemail" && "$pemail" == "$live" ]]; then
+      # Same account as the live session — rotating its token would log it out, so
+      # read the fresh token from the Keychain instead of ever refreshing it.
+      ptoken="$(get_access_token || true)"
+    else
+      # A genuinely different account: safe to refresh directly (its refresh chain
+      # is independent of the live session's). Only refresh when actually expired.
+      if token_expired "$creds"; then
+        refresh_profile_token "$name" || true
+      fi
+      ptoken="$(get_access_token "$creds" || true)"
+    fi
+  elif [[ "$name" == "$active" && -f "$CLAUDE_DIR/.credentials.json" ]] \
+       && ! token_expired "$CLAUDE_DIR/.credentials.json"; then
+    ptoken="$(get_access_token "$CLAUDE_DIR/.credentials.json" || true)"
+  else
+    if token_expired "$creds"; then
+      refresh_profile_token "$name" || true
+    fi
+    ptoken="$(get_access_token "$creds" || true)"
   fi
-
-  local ptoken; ptoken="$(get_access_token "$creds" || true)"
   [[ -n "$ptoken" ]] || return 1
 
   local before after
