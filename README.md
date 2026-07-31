@@ -44,6 +44,9 @@ claudius list [--json]        list profiles + cached usage (+ active flag)
 claudius status [--json]      show the active profile's live identity + usage
 claudius refresh <profile>    renew token if needed & rewrite the usage cache
 claudius activate <profile>   switch the global ~/.claude to <profile>
+claudius run [profile] [args] open a claude session in <profile> WITHOUT
+                              switching the global account (no name = pick)
+claudius link <profile>       (re)wire a profile for shared sessions, no launch
 claudius add [name]           add a new profile (interactive browser login)
 claudius serve [--port N] [--open]
                               run the localhost dashboard (browser tab)
@@ -52,6 +55,72 @@ claudius help | -h            show this help
 ```
 
 `--json` output is the stable contract the dashboard consumes.
+
+## Several accounts at once (`run`)
+
+`activate` switches the **one** global account that every `claude` then uses.
+`run` leaves that alone and opens a session **in** a profile, so you can have
+several accounts working at the same time in different terminals:
+
+```bash
+claudius run work                  # interactive session on the 'work' account
+claudius run work --model sonnet    # extra args go straight to `claude`
+claudius run                        # no name → pick from a list
+```
+
+It never touches the global `~/.claude` session, the active-profile marker, or
+your live token. Under the hood it points `CLAUDE_CONFIG_DIR` at the profile's
+own dir and `exec`s `claude`, so signals, exit codes and the TTY behave exactly
+as they do for a bare `claude`. In the TUI, press **`o`** on a profile to do the
+same thing.
+
+### Your work follows you across accounts
+
+A config dir is normally a clean slate — which would mean no agents, no slash
+commands and, worse, **no conversation history**, so `claude -c` / `--resume`
+would come up empty. So `run` wires each profile to **share your global
+`~/.claude`** as one pool:
+
+| shared (symlinked into the profile) | private to each profile |
+| --- | --- |
+| `projects/` — transcripts, so `-c`/`--resume` see sessions from **any** account | `.credentials.json` — the OAuth token |
+| `history.jsonl` — one `↑` prompt history | `.claude.json` — the account identity |
+| `agents/`, `commands/`, `skills/`, `CLAUDE.md`, `plugins/` | `settings.json` — merged, not linked (see below) |
+| session state: `sessions/`, `file-history/`, `plans/`, `tasks/`, … | `.usage`, `backups/`, daemon/lock runtime files |
+
+Because the pool **is** `~/.claude`, a session started by plain `claude`
+participates too — start work under one account and resume it under another.
+
+It's a denylist, so anything Claude Code adds to `~/.claude` in future is shared
+automatically rather than silently missing. Two things are merged rather than
+linked, because they must stay per-profile files:
+
+- **`settings.json`** — global keys (permissions, hooks, env, model defaults)
+  fill any gap on first wiring, while the profile's own keys win, so each keeps
+  its own `statusLine`. Backed up once as `settings.json.claudius-bak`.
+- **the `projects` key of `.claude.json`** — per-repo trust ("do you trust this
+  folder?"), `allowedTools` and project MCP servers are copied across on every
+  launch for paths the profile lacks, so run sessions don't re-prompt. Your
+  `oauthAccount` is never touched.
+
+Wiring happens on a profile's first `run` (and at `add` time for new profiles).
+`claudius link <profile>` does it on demand and is idempotent. If a profile
+already has its own `projects/` or `history.jsonl`, claudius **asks first**, then
+folds it into the pool, sets the old copy aside as `<name>.pre-share.bak`, and
+replaces it with a symlink — nothing is deleted, and a non-interactive run
+refuses rather than moving data unasked.
+
+Sharing is unconditional — there is no opt-out flag, because separating your
+work is not what multiple accounts are for. If you need a genuinely private
+config dir, point `CLAUDE_CONFIG_DIR` at a directory claudius doesn't manage.
+
+### macOS
+
+The OAuth token lives in the shared login Keychain, and `CLAUDE_CONFIG_DIR` does
+**not** redirect it — so a session launched there would use whichever account is
+globally live, not the one you named. Rather than silently run the wrong account,
+`run` refuses when the profile isn't the live one and points you at `activate`.
+Concurrent accounts therefore work on Linux/WSL, not on macOS.
 
 ## Dashboard
 
@@ -122,3 +191,4 @@ format is `u5 u7 uts r5 r7` in `~/.claude-profiles/<name>/.usage`.
 - `statusline.sh` — the shared status line (usage display + free cache warming)
 - `statusline-usage-cache.js` — filter to warm the cache from your own status line
 - `install.sh` — portable installer
+- `tests/share.sh` — sandbox tests for the shared-session wiring (throwaway `HOME`)

@@ -490,7 +490,11 @@ RB
 # authenticated request, which transparently refreshes the token and writes the new
 # credentials back into the dir. Returns 0 if the stored token is fresh afterwards.
 refresh_profile_token() {
-  local name="$1" dir="$PROFILE_ROOT/$name"
+  # Two `local`s deliberately: within a single `local`, a later assignment cannot
+  # see an earlier one on the same line (it expands to the pre-declaration value),
+  # which silently made `dir` just "$PROFILE_ROOT/".
+  local name="$1"
+  local dir="$PROFILE_ROOT/$name"
   if keychain_available; then
     oauth_refresh_creds "$dir/.credentials.json"
     return
@@ -849,9 +853,11 @@ activate_profile() {
   chmod 600 "$ACTIVE_PROFILE_FILE" 2>/dev/null || true
   printf '%s✓%s Activated Claude profile: %s%s%s\n' "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
   show_account_status "$name"
-  # This profile dir also works directly as a config dir (e.g. for T3):
+  # This profile dir also works directly as a config dir (e.g. for T3) — and
+  # `run` is the supported way to use it, without disturbing the global account.
   printf '%s  config dir:%s %s%s%s\n' "$C_MUTED" "$C_RESET" "$C_ACCENT" "$source_dir" "$C_RESET"
-  printf '%s  export CLAUDE_CONFIG_DIR=%q%s\n' "$C_DIM" "$source_dir" "$C_RESET"
+  printf '%s  open a session without switching accounts:%s %s run %s\n' \
+    "$C_MUTED" "$C_RESET" "$(basename "$0")" "$name"
 }
 
 # Delete a stored profile (its whole config dir: credentials, identity, usage
@@ -876,6 +882,437 @@ remove_profile() {
   local active; active="$(get_active_profile || true)"
   [[ "$active" == "$name" ]] && rm -f "$ACTIVE_PROFILE_FILE"
   return 0
+}
+
+# ── Shared-session wiring ─────────────────────────────────────────────────────
+# A profile dir is a full CLAUDE_CONFIG_DIR, so a session launched in one sees
+# NONE of your global ~/.claude by default: no agents, no slash commands, and —
+# the big one — no conversation history, so `claude -c` / `--resume` come up
+# empty. `claudius run` therefore wires the profile to SHARE the global ~/.claude
+# as a single pool, symlinking every entry except the few that must stay
+# per-account. Sharing is the deliberate point: multiple accounts should separate
+# identity and billing, not your work. Because the pool IS ~/.claude, a session
+# started by bare `claude` participates too — resume it from any profile, and
+# vice versa.
+#
+# It's a DENYLIST, not an allowlist: whatever Claude Code adds to ~/.claude in
+# future is shared automatically rather than silently missing from run sessions.
+
+# Entries that are NEVER linked: they define which account this is, or they are
+# per-process runtime state that two sessions must not share.
+share_is_isolated() {
+  case "$1" in
+    # Identity + token — the entire reason profiles exist.
+    .credentials.json|.claude.json|claude.json) return 0 ;;
+    # Merged key-by-key instead (see merge_profile_settings) so each profile can
+    # keep its own statusLine while inheriting global permissions/hooks/env.
+    settings.json|settings.json.bak|settings.local.json) return 0 ;;
+    # claudius's own per-profile state.
+    .usage|backups) return 0 ;;
+    # Runtime/pid state: locks, the background daemon, IDE handshake files.
+    daemon|daemon.*|daemon-*|ide) return 0 ;;
+    *.lock|*.pid|*.tmp) return 0 ;;
+    # Never re-link something we set aside earlier.
+    *.pre-share.bak) return 0 ;;
+    ''|.|..) return 0 ;;
+  esac
+  return 1
+}
+
+# Names of the immediate children of ~/.claude, dotfiles included. Uses a
+# subshell so `dotglob`/`nullglob` never leak into the rest of the script.
+share_entries() {
+  ( shopt -s nullglob dotglob
+    local p
+    for p in "$CLAUDE_DIR"/*; do
+      printf '%s\n' "${p##*/}"
+    done )
+}
+
+# What a merge would actually do to this entry, for the confirmation prompt. Kept
+# in step with the act loop in wire_profile_sharing — a prompt that misdescribes
+# the work is worse than no prompt.
+share_merge_note() {
+  local own="$1" pool="$2"
+  if [[ -d "$own" ]]; then
+    local n=0
+    n="$(share_missing_children "$own" "$pool" | wc -l | tr -d ' ')"
+    printf '%s item(s) copied into the pool' "$n"
+  elif [[ ! -e "$pool" ]]; then
+    printf 'moved into the pool'
+  elif [[ "$own" == *.jsonl ]]; then
+    printf 'new lines appended (duplicates skipped)'
+  else
+    printf 'kept as a backup only (the pool already has one)'
+  fi
+}
+
+# Children of $1 that the pool $2 does not already have.
+share_missing_children() {
+  ( shopt -s nullglob dotglob
+    local c b
+    for c in "$1"/*; do
+      b="${c##*/}"
+      [[ -e "$2/$b" ]] && continue
+      printf '%s\n' "$b"
+    done )
+}
+
+# ── Plan / act ────────────────────────────────────────────────────────────────
+# Planning is strictly read-only so the confirmation prompt can describe exactly
+# what will happen before anything on disk moves.
+SHARE_PLAN_LINK=()     # nothing in the way — just symlink (silent)
+SHARE_PLAN_RELINK=()   # a symlink pointing somewhere else — repoint (silent)
+SHARE_PLAN_MERGE=()    # REAL data in the profile — merge + set aside (confirm)
+SHARE_PLAN_NOTE=()     # parallel to SHARE_PLAN_MERGE
+
+share_plan() {
+  local dir="$1"
+  SHARE_PLAN_LINK=(); SHARE_PLAN_RELINK=(); SHARE_PLAN_MERGE=(); SHARE_PLAN_NOTE=()
+  [[ -d "$CLAUDE_DIR" ]] || return 0
+  local entry src dst
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    share_is_isolated "$entry" && continue
+    src="$CLAUDE_DIR/$entry"
+    dst="$dir/$entry"
+    if [[ -L "$dst" ]]; then
+      [[ "$(readlink "$dst" 2>/dev/null)" == "$src" ]] && continue
+      SHARE_PLAN_RELINK+=("$entry")
+    elif [[ -e "$dst" ]]; then
+      SHARE_PLAN_MERGE+=("$entry")
+      SHARE_PLAN_NOTE+=("$(share_merge_note "$dst" "$src")")
+    else
+      SHARE_PLAN_LINK+=("$entry")
+    fi
+  done < <(share_entries)
+}
+
+# Fold a profile's own directory into the shared pool: copy only what the pool
+# lacks, so nothing already there is overwritten.
+share_merge_dir() {
+  local own="$1" pool="$2" b
+  mkdir -p "$pool"
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    cp -R "$own/$b" "$pool/$b" 2>/dev/null || true
+  done < <(share_missing_children "$own" "$pool")
+}
+
+# Append a profile's JSONL lines to the pool's copy, skipping lines already
+# present. Used for history.jsonl (prompt recall), where order is chronological
+# and exact-duplicate lines carry no extra information.
+share_merge_jsonl() {
+  local own="$1" pool="$2"
+  ruby - "$own" "$pool" <<'RB'
+own, pool = ARGV[0], ARGV[1]
+seen = {}
+if File.file?(pool)
+  begin
+    File.foreach(pool) { |l| seen[l.chomp] = true }
+  rescue
+  end
+end
+add = []
+begin
+  File.foreach(own) do |l|
+    l = l.chomp
+    next if l.empty? || seen[l]
+    seen[l] = true
+    add << l
+  end
+rescue
+  exit 0
+end
+exit 0 if add.empty?
+begin
+  File.open(pool, 'a') { |f| add.each { |l| f.puts l } }
+rescue
+  exit 1
+end
+RB
+}
+
+# Set a profile's own copy aside under a .pre-share.bak name that doesn't collide
+# with an earlier one. Prints the chosen path.
+share_set_aside() {
+  local path="$1" bak="$1.pre-share.bak" i=2
+  while [[ -e "$bak" ]]; do
+    bak="$1.pre-share.$i.bak"
+    i=$(( i + 1 ))
+  done
+  mv "$path" "$bak" && printf '%s' "$bak"
+}
+
+# Wire one profile to the shared pool. Idempotent: re-running only fixes what is
+# missing or mis-pointed. $2 = how to handle a merge that would move real data:
+# true = prompt, false = refuse (non-interactive), auto = proceed (only for a
+# profile this same command just created, whose contents are seconds-old login
+# scaffolding rather than anything the user made).
+# Returns nonzero only when a merge was needed and could not be confirmed.
+wire_profile_sharing() {
+  local name="$1" interactive="${2:-true}"
+  local dir="$PROFILE_ROOT/$name"
+  [[ -d "$dir" ]] || return 1
+  [[ -d "$CLAUDE_DIR" ]] || return 0
+
+  share_plan "$dir"
+
+  local n_merge=${#SHARE_PLAN_MERGE[@]} i
+  if (( n_merge > 0 )) && [[ "$interactive" != auto ]]; then
+    # Real data would move. Describe it precisely, then ask — a symlink is
+    # reversible, a merged history is not.
+    printf "\n%s'%s' has its own session data.%s Wiring it for sharing will:\n" \
+      "$C_AMBER" "$name" "$C_RESET"
+    for (( i = 0; i < n_merge; i++ )); do
+      printf '  %s•%s %-18s %s\n' "$C_MUTED" "$C_RESET" \
+        "${SHARE_PLAN_MERGE[$i]}" "${SHARE_PLAN_NOTE[$i]}"
+    done
+    printf '  %sthen each is set aside as <name>.pre-share.bak and replaced with a\n' "$C_MUTED"
+    printf '  symlink into %s%s\n' "$CLAUDE_DIR" "$C_RESET"
+    if [[ "$interactive" != true ]]; then
+      printf '\n%sRefusing to move data without confirmation.%s Run `%s link %s` in a terminal first.\n' \
+        "$C_AMBER" "$C_RESET" "$(basename "$0")" "$name" >&2
+      return 1
+    fi
+    printf '\nProceed? %s[y/N]%s ' "$C_MUTED" "$C_RESET"
+    local reply=""
+    read -r reply || reply=""
+    case "$reply" in
+      y|Y|yes|YES) ;;
+      *) echo "Cancelled."; return 1 ;;
+    esac
+  fi
+
+  if (( n_merge > 0 )); then
+    for (( i = 0; i < n_merge; i++ )); do
+      local entry="${SHARE_PLAN_MERGE[$i]}"
+      local own="$dir/$entry" pool="$CLAUDE_DIR/$entry"
+      if [[ -d "$own" ]]; then
+        share_merge_dir "$own" "$pool"
+      elif [[ "$entry" == *.jsonl && -f "$pool" ]]; then
+        share_merge_jsonl "$own" "$pool"
+      elif [[ ! -e "$pool" ]]; then
+        cp -R "$own" "$pool" 2>/dev/null || true
+      fi
+      share_set_aside "$own" >/dev/null || continue
+      ln -s "$pool" "$own" 2>/dev/null || true
+    done
+  fi
+
+  local entry
+  if (( ${#SHARE_PLAN_RELINK[@]} > 0 )); then
+    for entry in "${SHARE_PLAN_RELINK[@]}"; do
+      rm -f "$dir/$entry"
+      ln -s "$CLAUDE_DIR/$entry" "$dir/$entry" 2>/dev/null || true
+    done
+  fi
+  if (( ${#SHARE_PLAN_LINK[@]} > 0 )); then
+    for entry in "${SHARE_PLAN_LINK[@]}"; do
+      ln -s "$CLAUDE_DIR/$entry" "$dir/$entry" 2>/dev/null || true
+    done
+  fi
+  return 0
+}
+
+# Fill gaps in a profile's settings.json from the global one: permissions, hooks,
+# env, model defaults and the like carry into run sessions, while any key the
+# profile already has (notably claudius's own statusLine) wins. Backs the profile
+# copy up once before the first rewrite. Same conservative merge as
+# `claudius statusline` — other keys are never disturbed.
+merge_profile_settings() {
+  local name="$1"
+  local dir="$PROFILE_ROOT/$name"
+  local glob="$CLAUDE_DIR/settings.json"
+  [[ -f "$glob" ]] || return 0
+  ruby - "$dir/settings.json" "$glob" <<'RB'
+require 'json'
+prof, glob = ARGV[0], ARGV[1]
+def load(p)
+  return nil unless File.file?(p)
+  d = JSON.parse(File.read(p)) rescue nil
+  d.is_a?(Hash) ? d : nil
+end
+g = load(glob)
+exit 0 unless g
+p = load(prof) || {}
+changed = false
+g.each do |k, v|
+  next if p.key?(k)
+  p[k] = v
+  changed = true
+end
+exit 0 unless changed
+bak = prof + '.claudius-bak'
+begin
+  require 'fileutils'
+  FileUtils.cp(prof, bak) if File.file?(prof) && !File.exist?(bak)
+  tmp = prof + '.tmp'
+  File.write(tmp, JSON.pretty_generate(p))
+  File.chmod(0o600, tmp)
+  File.rename(tmp, prof)
+rescue
+  exit 1
+end
+RB
+}
+
+# Per-project state (trust-dialog acceptance, allowedTools, project-scope MCP
+# servers) lives in the `projects` key of the identity file — which cannot be
+# symlinked, since the rest of that file is what makes the profile a distinct
+# account. So copy across any project entry the profile lacks. Runs on every
+# launch, not just the first, so repos you start using later don't re-prompt for
+# trust in run sessions. `oauthAccount` and the profile's own entries are never
+# touched.
+sync_profile_projects_key() {
+  local name="$1"
+  local dir="$PROFILE_ROOT/$name"
+  local prof; prof="$(profile_identity_path "$dir")"
+  [[ -f "$CLAUDE_CONFIG" ]] || return 0
+  ruby - "$prof" "$CLAUDE_CONFIG" <<'RB'
+require 'json'
+prof, glob = ARGV[0], ARGV[1]
+def load(p)
+  return nil unless File.file?(p)
+  d = JSON.parse(File.read(p)) rescue nil
+  d.is_a?(Hash) ? d : nil
+end
+g = load(glob) or exit 0
+d = load(prof) or exit 0
+gp = g['projects']
+exit 0 unless gp.is_a?(Hash)
+dp = d['projects']
+dp = {} unless dp.is_a?(Hash)
+changed = false
+gp.each do |path, cfg|
+  next if dp.key?(path)
+  dp[path] = cfg
+  changed = true
+end
+exit 0 unless changed
+d['projects'] = dp
+begin
+  tmp = prof + '.tmp'
+  File.write(tmp, JSON.generate(d))
+  File.chmod(0o600, tmp)
+  File.rename(tmp, prof)
+rescue
+  exit 1
+end
+RB
+}
+
+# ── Launching a session in a profile ──────────────────────────────────────────
+# The account recorded in the GLOBAL identity file (~/.claude.json). Unlike
+# live_account_email this works on Linux, where there is no Keychain and the
+# global file is the live session's identity.
+global_identity_email() {
+  [[ -f "$CLAUDE_CONFIG" ]] || return 0
+  ruby -rjson -e 'begin; d=JSON.parse(File.read(ARGV[0])); rescue; exit 0; end; puts((d["oauthAccount"]||{})["emailAddress"]||"")' \
+    "$CLAUDE_CONFIG" 2>/dev/null
+}
+
+# Make sure the profile's stored token is usable before we hand off to claude.
+# Deliberately free — no Haiku call, unlike refresh_profile_usage. Nonzero (with a
+# message) only when the token is expired and cannot be renewed.
+run_prepare_token() {
+  local name="$1"
+  local dir="$PROFILE_ROOT/$name"
+  local creds="$dir/.credentials.json"
+
+  # macOS: claude reads the live token from the shared Keychain, which the CLI
+  # keeps fresh, and run_profile has already established this profile IS the live
+  # account. The file's own freshness is irrelevant there.
+  keychain_available && return 0
+
+  token_expired "$creds" || return 0
+
+  # If this profile is the account currently live in ~/.claude and that copy is
+  # still fresh, adopt it rather than rotating. OAuth refresh tokens are
+  # single-use: rotating one that the live session also holds would log it out.
+  local live_email prof_email
+  live_email="$(global_identity_email)"
+  prof_email="$(profile_account_email "$name")"
+  if [[ -n "$live_email" && "$live_email" == "$prof_email" ]] &&
+     [[ -f "$CLAUDE_DIR/.credentials.json" ]] &&
+     ! token_expired "$CLAUDE_DIR/.credentials.json"; then
+    cp "$CLAUDE_DIR/.credentials.json" "$creds"
+    chmod 600 "$creds" 2>/dev/null || true
+    return 0
+  fi
+
+  printf '%s·%s token expired — refreshing… ' "$C_MUTED" "$C_RESET"
+  if oauth_refresh_creds "$creds"; then
+    printf '%sok%s\n' "$C_GREEN" "$C_RESET"
+    # Refresh tokens are single-use and rotate server-side. If the global session
+    # is the SAME account, its stored copy just became stale, so hand it the new
+    # credential rather than leaving a bare `claude` needing a re-login. Same
+    # account, fresher token — exactly what activate_profile writes there anyway.
+    if [[ -n "$live_email" && "$live_email" == "$prof_email" && -f "$CLAUDE_DIR/.credentials.json" ]]; then
+      cp "$creds" "$CLAUDE_DIR/.credentials.json"
+      chmod 600 "$CLAUDE_DIR/.credentials.json" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  printf '%sfailed%s\n' "$C_AMBER" "$C_RESET"
+  printf "Could not renew the token for '%s'. Sign in again: %s add %s\n" \
+    "$name" "$(basename "$0")" "$name" >&2
+  return 1
+}
+
+# Launch `claude` (plus any extra args) inside a profile's config dir, WITHOUT
+# touching the global ~/.claude session or the active-profile marker. exec's, so
+# no wrapper process is left behind and signals/exit codes/TTY behave exactly as
+# they would for a bare `claude`.
+run_profile() {
+  local name="$1"
+  shift
+  local dir="$PROFILE_ROOT/$name"
+
+  if [[ ! -d "$dir" ]]; then
+    echo "Profile '$name' does not exist." >&2
+    return 1
+  fi
+  if [[ ! -f "$dir/.credentials.json" ]]; then
+    echo "Profile '$name' has no saved credentials; cannot run it." >&2
+    return 1
+  fi
+
+  # On macOS the OAuth token lives in the shared login Keychain and
+  # CLAUDE_CONFIG_DIR does NOT redirect it, so a session launched here would use
+  # whichever account is globally live — not the one asked for. Refuse rather
+  # than silently run the wrong account.
+  if keychain_available; then
+    local live prof
+    live="$(live_account_email)"
+    prof="$(profile_account_email "$name")"
+    if [[ -n "$live" && -n "$prof" && "$live" != "$prof" ]]; then
+      printf '%serror:%s on macOS the live token is shared via the login Keychain,\n' \
+        "$C_AMBER" "$C_RESET" >&2
+      printf '  so a session here cannot use a different account.\n' >&2
+      printf '    live account: %s\n' "$live" >&2
+      printf '    requested:    %s\n' "$prof" >&2
+      printf '  Run `%s activate %s` to switch the global account instead.\n' \
+        "$(basename "$0")" "$name" >&2
+      return 1
+    fi
+  fi
+
+  normalize_profile_identity "$name"
+  run_prepare_token "$name" || return 1
+
+  local interactive=true
+  { [[ -t 0 ]] && [[ -t 1 ]]; } || interactive=false
+  wire_profile_sharing "$name" "$interactive" || return 1
+  merge_profile_settings "$name" || true
+  sync_profile_projects_key "$name" || true
+
+  local email; email="$(profile_account_email "$name")"
+  printf '%s·%s %s%s%s %s %s%s%s\n' \
+    "$C_MUTED" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" \
+    "$GLYPH_DOT" "$C_DIM" "${email:-no identity saved}" "$C_RESET"
+
+  exec env CLAUDE_CONFIG_DIR="$dir" claude "$@"
 }
 
 # ── Menu data + rendering ─────────────────────────────────────────────────────
@@ -1040,6 +1477,7 @@ render_menu() {
     add "  ${C_MUTED}config dir:${C_RESET} ${C_ACCENT}${PROFILE_ROOT}/${PROFILES[$selected_index]}${C_RESET}"
   fi
   local keybar="  ${C_KEY}↑↓${C_RESET}${C_MUTED} move   ${C_RESET}${C_KEY}⏎${C_RESET}${C_MUTED} select   ${C_RESET}"
+  (( profile_count > 0 )) && keybar+="${C_KEY}o${C_RESET}${C_MUTED} open   ${C_RESET}"
   (( profile_count > 0 )) && keybar+="${C_KEY}r${C_RESET}${C_MUTED} refresh usage   ${C_RESET}"
   (( profile_count > 0 )) && keybar+="${C_KEY}d${C_RESET}${C_MUTED} remove   ${C_RESET}"
   keybar+="${C_KEY}a${C_RESET}${C_MUTED} add   ${C_RESET}${C_KEY}q${C_RESET}${C_MUTED} quit${C_RESET}"
@@ -1209,6 +1647,21 @@ show_menu() {
               "$C_AMBER" "$rname" "$C_RESET" 12 ''
             sleep 1.8
           fi
+        fi
+        ;;
+      o|O)
+        # Open a session in the selected profile WITHOUT switching the global
+        # account. run_profile exec's, so hand the real terminal back first —
+        # otherwise claude would inherit raw mode and the alt screen.
+        if (( profile_count > 0 && selected_index < profile_count )); then
+          local oname="${PROFILES[$selected_index]}"
+          disable_raw_mode
+          leave_alt_screen
+          show_cursor
+          # Only returns on failure (bad profile / unrenewable token / declined
+          # merge); on success it has already replaced this process with claude.
+          run_profile "$oname" || return 1
+          return 0
         fi
         ;;
       d|D)
@@ -1400,6 +1853,12 @@ add_new_profile() {
     # A fresh login leaves onboarding "incomplete"; stamp it so the dir is usable
     # directly as CLAUDE_CONFIG_DIR without re-prompting login.
     normalize_profile_identity "$new_name"
+    # Wire it for shared sessions now, so `claudius run <name>` is usable
+    # immediately. "auto" because anything in this dir is login scaffolding this
+    # command just produced — there is no pre-existing user data to ask about.
+    wire_profile_sharing "$new_name" "$( [[ "$pre_existed" == true ]] && printf 'true' || printf 'auto')" || true
+    merge_profile_settings "$new_name" || true
+    sync_profile_projects_key "$new_name" || true
     # Separator only — no screen clear (see note above). Summary flows inline.
     printf '\n%s%s%s\n' "$C_RULE" "────────────────────────────────────────" "$C_RESET"
     # Also make it the active global account for bare `claude` (saves the previous).
@@ -1575,6 +2034,134 @@ cmd_remove() {
   fi
 }
 
+# Minimal arrow-key picker over the stored profiles, for bare `claudius run`.
+# Sets PICKED to the chosen name (empty when cancelled). Deliberately its own
+# small frame rather than a mode bolted onto show_menu: the only action is "pick
+# one", so none of the menu's activate/remove/add machinery applies.
+PICKED=""
+pick_profile() {
+  local title="Run claude in which profile?"
+  PICKED=""
+  PROFILES=()
+  local p
+  while IFS= read -r p; do
+    [[ -n "$p" ]] && PROFILES+=("$p")
+  done < <(list_profiles)
+  local count=${#PROFILES[@]}
+  if (( count == 0 )); then
+    echo "No profiles yet. Add one: $(basename "$0") add <name>" >&2
+    return 1
+  fi
+  build_profile_meta
+
+  local active; active="$(get_active_profile || true)"
+  local sel=0 i
+  for (( i = 0; i < count; i++ )); do
+    if [[ "${PROFILES[$i]}" == "$active" ]]; then sel="$i"; break; fi
+  done
+
+  enable_raw_mode
+  enter_alt_screen
+  clear_screen
+
+  local cols card body_w
+  cols="$(term_cols)"
+  card=$(( cols - 4 )); (( card > 92 )) && card=92; (( card < 40 )) && card=40
+  body_w=$(( card - 2 ))
+
+  local key out nl=$'\n' clr=$'\033[K'
+  while true; do
+    hide_cursor
+    out=""
+    out+="$clr$nl"
+    out+="  ${C_TITLE}${title}${C_RESET}$clr$nl"
+    out+="$clr$nl"
+    for (( i = 0; i < count; i++ )); do
+      build_profile_row "$i" "$body_w"
+      if (( i == sel )); then
+        out+="  ${C_SEL}$(pad_to "$card" "${GLYPH_POINTER} ${ROW_BODY_PLAIN}")${C_RESET}$clr$nl"
+      else
+        local mk="  "
+        [[ "${PROFILES[$i]}" == "$active" ]] && mk="${C_ACTIVE}${GLYPH_ACTIVE}${C_RESET} "
+        out+="  ${mk}${ROW_BODY_COLOR}$clr$nl"
+      fi
+    done
+    out+="$clr$nl"
+    out+="  ${C_KEY}↑↓${C_RESET}${C_MUTED} move   ${C_RESET}${C_KEY}⏎${C_RESET}${C_MUTED} run   ${C_RESET}${C_KEY}esc${C_RESET}${C_MUTED} cancel${C_RESET}$clr$nl"
+    printf '\033[H%s\033[J' "$out"
+
+    if ! read_key key; then
+      disable_raw_mode; leave_alt_screen; show_cursor
+      return 1
+    fi
+    case "$key" in
+      $'\e'|q|Q)
+        disable_raw_mode; leave_alt_screen; show_cursor
+        return 1
+        ;;
+      $'\e[A'|$'\eOA') sel=$(( (sel + count - 1) % count )) ;;
+      $'\e[B'|$'\eOB') sel=$(( (sel + 1) % count )) ;;
+      $'\n'|$'\r')
+        PICKED="${PROFILES[$sel]}"
+        disable_raw_mode; leave_alt_screen; show_cursor
+        return 0
+        ;;
+    esac
+  done
+}
+
+# claudius run [<profile>] [claude args…]
+# Everything after the profile name is passed to `claude` verbatim, so
+# `claudius run work --model sonnet -p "hi"` works as expected. No flags of our
+# own, deliberately: anything we invented here would collide with claude's.
+cmd_run() {
+  local name="${1:-}"
+  if [[ -n "$name" ]]; then
+    shift
+  else
+    # No profile given: pick one interactively (a tty is required for that).
+    if ! { [[ -t 0 ]] && [[ -t 1 ]]; }; then
+      echo "usage: $(basename "$0") run <profile> [claude args…]" >&2
+      return 2
+    fi
+    pick_profile || return 1
+    name="$PICKED"
+    [[ -n "$name" ]] || return 1
+  fi
+
+  run_profile "$name" "$@"
+}
+
+# claudius link <profile> — (re)wire a profile for shared sessions without
+# launching anything. Idempotent; useful to repair a profile or to opt an old one
+# in ahead of time. Reports what it did rather than exec'ing claude.
+cmd_link() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: $(basename "$0") link <profile>" >&2
+    return 2
+  fi
+  if [[ ! -d "$PROFILE_ROOT/$name" ]]; then
+    echo "Profile '$name' does not exist." >&2
+    return 1
+  fi
+  normalize_profile_identity "$name"
+  local interactive=true
+  { [[ -t 0 ]] && [[ -t 1 ]]; } || interactive=false
+  wire_profile_sharing "$name" "$interactive" || return 1
+  merge_profile_settings "$name" || true
+  sync_profile_projects_key "$name" || true
+  local n_new=$(( ${#SHARE_PLAN_LINK[@]} + ${#SHARE_PLAN_RELINK[@]} + ${#SHARE_PLAN_MERGE[@]} ))
+  if (( n_new > 0 )); then
+    printf '%s✓%s Wired %s%s%s for shared sessions (%d linked).\n' \
+      "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" "$n_new"
+  else
+    printf '%s✓%s %s%s%s is already wired for shared sessions.\n' \
+      "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
+  fi
+  printf '%s  run it with:%s %s run %s\n' "$C_MUTED" "$C_RESET" "$(basename "$0")" "$name"
+}
+
 # CLI add: interactive browser login, but plain terminal I/O (no alt-screen / raw
 # mode). Accepts an optional name argument, otherwise prompts on the plain tty.
 cmd_add() {
@@ -1618,6 +2205,10 @@ cmd_add() {
     chmod 600 "$target_dir/.credentials.json" 2>/dev/null || true
     [[ -f "$target_dir/.claude.json" ]] && chmod 600 "$target_dir/.claude.json" 2>/dev/null || true
     normalize_profile_identity "$new_name"
+    # See add_new_profile: wire for shared sessions so `run` works right away.
+    wire_profile_sharing "$new_name" "$( [[ "$pre_existed" == true ]] && printf 'true' || printf 'auto')" || true
+    merge_profile_settings "$new_name" || true
+    sync_profile_projects_key "$new_name" || true
     printf '\n%s%s%s\n' "$C_RULE" "────────────────────────────────────────" "$C_RESET"
     activate_profile "$new_name"
     printf '%s✓%s Created profile %s%s%s.\n' \
@@ -1739,12 +2330,27 @@ ${C_MUTED}USAGE${C_RESET}
   $prog status [--json]      show the active profile's live identity + usage
   $prog refresh <profile>    renew token if needed & rewrite the usage cache
   $prog activate <profile>   switch the global ~/.claude to <profile>
+  $prog run [profile] [args] open a session in <profile> without switching
+                             the global account (no profile = pick one)
+  $prog link <profile>       (re)wire a profile for shared sessions only
   $prog add [name]           add a new profile (interactive browser login)
   $prog remove <profile>     delete a stored profile (does not sign you out)
   $prog serve [--port N] [--open]
                              run the localhost dashboard (browser tab)
   $prog statusline [--remove] enable (or remove) the team status line in Claude Code
   $prog help | -h            show this help
+
+${C_MUTED}RUN vs ACTIVATE${C_RESET}
+  • 'activate' switches the ONE global account every 'claude' then uses.
+  • 'run' leaves the global account alone and opens a session in that profile —
+    so several accounts can be open at once. Any extra args go to 'claude':
+      $prog run work --model sonnet
+  • Run sessions SHARE your global ~/.claude: same conversation history (so
+    -c/--resume see sessions from any account), same agents, commands, skills,
+    prompt history and settings. Only the token + identity are per-profile.
+  • macOS: the OAuth token lives in the shared login Keychain, which
+    CLAUDE_CONFIG_DIR does not redirect — so 'run' can only open the account
+    that is currently live. Use 'activate' to switch accounts there.
 
 ${C_MUTED}NOTES${C_RESET}
   • --json output is the stable contract consumed by the dashboard.
@@ -1771,6 +2377,8 @@ main() {
     status)    cmd_status "$@" ;;
     refresh)   cmd_refresh "$@" ;;
     activate)  cmd_activate "$@" ;;
+    run|open)  cmd_run "$@" ;;
+    link)      cmd_link "$@" ;;
     add)       cmd_add "$@" ;;
     remove|rm|delete) cmd_remove "$@" ;;
     serve)     cmd_serve "$@" ;;
