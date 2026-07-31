@@ -234,3 +234,5 @@ format is `u5 u7 uts r5 r7` in `~/.claude-profiles/<name>/.usage`.
 - `statusline-usage-cache.js` — filter to warm the cache from your own status line
 - `install.sh` — portable installer
 - `tests/share.sh` — sandbox tests for the shared-session wiring (throwaway `HOME`)
+- `tests/dashboard.sh` — the page's own logic, run under node against stubs
+- `tests/dashboard-live.sh` — the page driven in a headless browser, read-only

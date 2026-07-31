@@ -69,7 +69,25 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   design rules and the three traps it lists.
 - Verify by serving the page, not by reading the diff:
   `ruby claude-dashboard.rb --port 8799 --root "$HOME/.claude-profiles" --script "$PWD/claudius"`
-- Stop the server and confirm the port is closed when done.
+- Stop the server and confirm the port is closed when done. Check for a dashboard
+  already running on another port first and leave it alone — it is probably the
+  user's.
+- **Look at the page.** Chromium ships with Playwright's cache; a visual change is
+  not verified until it has been seen:
+  ```
+  CHROME=~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome
+  $CHROME --headless=new --disable-gpu --no-sandbox --hide-scrollbars \
+    --window-size=1320,1500 --virtual-time-budget=6000 \
+    --screenshot=/tmp/dash.png http://127.0.0.1:8799/
+  convert /tmp/dash.png -crop 1100x360+110+640 +repage -resize 150% /tmp/crop.png
+  ```
+  Crop to the region under review — full-page shots are too coarse to judge
+  spacing. Bar fills animate, so a shot taken under a short virtual-time budget
+  can show them empty; that is the screenshot, not the page.
+- To photograph a state that needs interaction (a filled search box, an open
+  filter), copy `claude-dashboard.rb` and the page to a scratch directory, seed the
+  state in the copy, and serve that on another port. Never edit the real page to
+  take a picture.
 
 ## Tests
 
@@ -82,10 +100,24 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 - A test that touches credentials must state its platform — stub
   `keychain_available` explicitly. On a Mac it is true by default, so a test
   written for the file path silently takes the Keychain branch instead.
-- Verify TUI and dashboard changes by hand — there is no suite for either.
 - Two accounts running concurrently on macOS is observed working on claude
   2.1.220. Still unobserved, so describe as reasoned: the fallback for a CLI too
   old to namespace the Keychain item, and the refusal paths.
+- Run `bash tests/dashboard.sh` (90 assertions, ~1s) after any change to
+  `dashboard.html`. It slices the page's `<script>` blocks by their `═══ banner ═══`
+  section comments and runs the pure logic under node against stubbed storage and
+  DOM. Renaming a banner breaks extraction loudly and on purpose — fix the test's
+  `want` list rather than letting it test nothing. node is not a claudius
+  dependency: the suite skips when it is absent.
+- Run `bash tests/dashboard-live.sh` (24 assertions, ~25s) for anything touching the
+  session panel, the filters or the keyboard. It starts its own sidecar and a
+  headless Chromium and drives the real page over the DevTools protocol — the layer
+  that caught a `cd` into the wrong directory and an encoded path leaking on screen.
+  Read-only: it never clicks anything that mutates. It skips when node or Chromium
+  is missing, when its port is taken (probably the user's dashboard), and
+  per-assertion when the pool lacks the shape being checked.
+- Verify TUI changes by hand — there is no suite for the TUI.
+- Do not claim macOS behaviour works. It cannot be tested here; say so.
 
 ## Commits
 
