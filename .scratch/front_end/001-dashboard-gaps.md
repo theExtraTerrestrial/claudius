@@ -3,26 +3,44 @@
 **Status:** open · **Opened:** 2026-07-31 · **Area:** `dashboard.html`, `claude-dashboard.rb`
 
 The redesigned dashboard covers monitoring plus three actions: switch account,
-read live limits, copy a run command. Four CLI capabilities have no route in the
-sidecar and no control on the page. This was deliberate — each needs design work
-that the redesign didn't include — but it means the page is knowingly not a full
-front-end, and someone will eventually ask why.
+read live limits, copy a run command. Four CLI capabilities had no route in the
+sidecar and no control on the page — deliberately, since each needed design work
+the redesign didn't include, but it meant the page was knowingly not a full
+front-end and someone would eventually ask why.
 
-Every item below needs **both** a new endpoint in `claude-dashboard.rb` and a
+**`add` is now done** (see below). The other three stand.
+
+Each remaining item needs **both** a new endpoint in `claude-dashboard.rb` and a
 control on the page. The sidecar shells back into the CLI for all mutations, so
 the CLI side already exists in each case.
 
 ## Blocked on a real design problem
 
-### `add` — cannot complete inside a POST
-`claudius add` opens a browser for an interactive OAuth login and waits. A POST
-handler cannot hold that: the request would hang for as long as the human takes,
-and the sidecar is single-threaded WEBrick. Needs either a job model (start,
-poll for status, report) or an honest punt — a panel that shows the command to
-run in a terminal and watches for the profile to appear.
+### ~~`add` — cannot complete inside a POST~~ **CLOSED 2026-08-01**
+The job model won, not the punt. Two facts made it worth building rather than
+avoiding, and both were unknown when this was written:
 
-Prefer the punt for now. The job model is a lot of machinery for something done
-once or twice per account.
+1. `claude auth login` does **not** need a TTY. Given a pipe on stdin it prints
+   its sign-in URL to stdout and carries on — so the page can hand you the link
+   without a terminal emulator anywhere in the picture. (Probed directly; the
+   process was killed before any sign-in could complete.)
+2. Both upstream variants — the browser handing the terminal the login, and the
+   site showing a code to paste — end at the same trailing "press enter". So
+   watching the FILESYSTEM for the credentials to appear, and supplying that
+   newline from the sidecar, collapses them into one code path. The page needs
+   exactly one interactive element, the code field, and it is optional.
+
+What killed the punt: it is the same amount of page for strictly less. The panel
+had to exist either way.
+
+Two bugs worth remembering, both found by `tests/add.sh` rather than by reading:
+`trap('TERM', &lambda)` never fires (trap passes the signal number, a nil-arity
+lambda raises, and the error is swallowed — the sidecar simply stopped shutting
+down), and publishing a terminal state before cleanup finished let the page
+reload the profile list while a half-made profile was still on disk.
+
+Still deliberately out: `--json` on `add`, and any reuse of the job model for a
+second command. One job at a time, one command, until there is a second need.
 
 ### `remove` — destructive, needs a confirmation design
 `claudius remove` deletes a profile directory. The page has no confirmation

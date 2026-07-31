@@ -3032,7 +3032,19 @@ cmd_link() {
 # CLI add: interactive browser login, but plain terminal I/O (no alt-screen / raw
 # mode). Accepts an optional name argument, otherwise prompts on the plain tty.
 cmd_add() {
-  local new_name="${1:-}"
+  # --no-activate leaves the global account alone. The terminal flow ends by
+  # switching to the profile you just made, which is nearly always what you meant
+  # there; on the dashboard it would mean the hero swapping under you when you
+  # asked to ADD an account, so the sidecar passes this and offers the switch as a
+  # choice instead.
+  local new_name="" do_activate=true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-activate) do_activate=false; shift ;;
+      -*) echo "usage: $(basename "$0") add [name] [--no-activate]" >&2; return 2 ;;
+      *)  [[ -z "$new_name" ]] && new_name="$1"; shift ;;
+    esac
+  done
   if [[ -z "$new_name" ]]; then
     printf '%sNew profile name%s ' "$C_ACCENT" "$C_RESET"
     IFS= read -r new_name || return 1
@@ -3077,7 +3089,12 @@ cmd_add() {
     merge_profile_settings "$new_name" || true
     sync_profile_projects_key "$new_name" || true
     printf '\n%s%s%s\n' "$C_RULE" "────────────────────────────────────────" "$C_RESET"
-    activate_profile "$new_name"
+    if [[ "$do_activate" == true ]]; then
+      activate_profile "$new_name"
+    else
+      printf '%s·%s left the global account alone — switch with: %s%s activate %s%s\n' \
+        "$C_MUTED" "$C_RESET" "$C_DIM" "$(basename "$0")" "$new_name" "$C_RESET"
+    fi
     printf '%s✓%s Created profile %s%s%s.\n' \
       "$C_GREEN" "$C_RESET" "$C_BOLD" "$new_name" "$C_RESET"
     return 0
@@ -3205,7 +3222,8 @@ ${C_MUTED}USAGE${C_RESET}
   $prog run [profile] [args] open a session in <profile> without switching
                              the global account (no profile = pick one)
   $prog link <profile>       (re)wire a profile for shared sessions only
-  $prog add [name]           add a new profile (interactive browser login)
+  $prog add [name] [--no-activate]
+                             add a new profile (interactive browser login)
   $prog remove <profile>     delete a stored profile (does not sign you out)
   $prog serve [--port N] [--open]
                              run the localhost dashboard (browser tab)

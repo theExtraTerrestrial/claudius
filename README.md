@@ -50,7 +50,8 @@ claudius activate <profile>   switch the global ~/.claude to <profile>
 claudius run [profile] [args] open a claude session in <profile> WITHOUT
                               switching the global account (no name = pick)
 claudius link <profile>       (re)wire a profile for shared sessions, no launch
-claudius add [name]           add a new profile (interactive browser login)
+claudius add [name] [--no-activate]
+                              add a new profile (interactive browser login)
 claudius serve [--port N] [--open]
                               run the localhost dashboard (browser tab)
 claudius statusline [--remove] enable (or remove) the shared status line
@@ -229,6 +230,14 @@ the hero slot as the switch lands.
 - **One card is chipped `use next`** — the account `claudius next` would pick,
   ranked by the same rules in the same place, so the page and the terminal can
   never disagree. When it is the account you are already on, it says so instead.
+- **Adding an account happens here now.** A ghost slot under the cards takes a
+  name, opens the Anthropic sign-in in a new tab, and takes a pasted code if the
+  page shows you one. It runs the same `claudius add` — the sidecar just holds the
+  door open, watches for the credentials to appear, and answers the trailing
+  prompt for you. A sign-in you abandon is cleaned up after ten minutes, and
+  unlike the terminal flow it leaves your global account alone unless you tick the
+  box. The code you paste is written straight to the process and is never logged,
+  echoed, or included in any response.
 - **The palette** (the `GLOBAL ·` chip) is one place to switch accounts, read all
   limits, and set preferences: reset display (**countdown** / **clock** /
   **total**), colour bias, and contrast intensity. All three are remembered in
@@ -242,8 +251,8 @@ the hero slot as the switch lands.
   and icons come from Google Fonts, so the page wants a network connection. Its
   header comment carries the design rules — read them before editing.
 
-The dashboard is a **monitor with a few actions**, not a full front-end: `add`,
-`remove` and `statusline` stay CLI-only for now. See `.scratch/front_end/`.
+The dashboard is a **monitor with a few actions**, not a full front-end: `remove`
+and `statusline` stay CLI-only for now. See `.scratch/front_end/`.
 
 ## Status line
 
@@ -297,3 +306,4 @@ minutes) — that log is what `claudius history` and the dashboard's burn rate r
 - `tests/dashboard.sh` — the page's own logic, run under node against stubs
 - `tests/dashboard-live.sh` — the page driven in a headless browser, read-only
 - `tests/history.sh` — the burn-rate arithmetic and the ranking (throwaway `HOME`)
+- `tests/add.sh` — the browser add flow, driven against a stub CLI (no real login)

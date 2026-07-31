@@ -59,7 +59,7 @@ marks.each_with_index do |(name, at), k|
   sections[name] = lines[(close + 1)...stop].join
 end
 
-want = ['linked sessions', 'history']
+want = ['linked sessions', 'history', 'add an account']
 missing = want.reject { |w| sections.key?(w) }
 abort "banner section(s) not found: #{missing.join(', ')} (have: #{sections.keys.join(' | ')})" if missing.any?
 
@@ -91,6 +91,7 @@ abort 'chunk not found: BIASES' if pieces['biases'].nil?
 pieces.each { |k, v| File.write(File.join(work, "piece-#{k}.js"), v) }
 File.write(File.join(work, 'sec-sessions.js'), sections['linked sessions'])
 File.write(File.join(work, 'sec-history.js'), sections['history'])
+File.write(File.join(work, 'sec-add.js'), sections['add an account'])
 RB
 [[ $? -eq 0 ]] || { printf 'extraction failed\n' >&2; exit 1; }
 
@@ -196,6 +197,24 @@ function loadHistory(state){
         if ('HIST' in o) HIST = o.HIST;
         if ('NEXT' in o) NEXT = o.NEXT;
         if ('ACTIVE' in o) ACTIVE = o.ACTIVE;
+      },
+    };`;
+  const api = new Function(`${src}\n${tail}`)();
+  if (state) api.set(state);
+  return api;
+}
+
+// The add-an-account panel. Only the parts that decide what is shown and what is
+// allowed — the fetches themselves belong to tests/add.sh, which drives the real
+// sidecar against a stub CLI.
+function loadAdd(state){
+  const src = [read("piece-esc.js"), "let PROFILES = [];", read("sec-add.js")].join("\n");
+  const tail = `
+    return {
+      fns:{ addNameOK, addNameProblem, addHTML },
+      set:(o) => {
+        if ('PROFILES' in o) PROFILES = o.PROFILES;
+        if ('ADD' in o) ADD = Object.assign({}, ADD, o.ADD);
       },
     };`;
   const api = new Function(`${src}\n${tail}`)();
@@ -528,6 +547,62 @@ console.log("14. the recommendation chip");
      !a.fns.nextChip("spare").includes("<img"));
   a.set({ NEXT:null });
   ok("nothing is chipped before the ranking has loaded", a.fns.nextChip("spare") === "");
+}
+
+console.log("15. a name is judged before anything irreversible happens");
+{
+  freshStorage(); stubDom();
+  const a = loadAdd({ PROFILES:[{ name:"work" }] });
+  const { addNameOK, addNameProblem } = a.fns;
+  ok("a plain name is fine", addNameOK("work2"));
+  ok("dots, dashes and underscores are fine", addNameOK("a.b-c_d"));
+  ok("a space is not", !addNameOK("my account"));
+  ok("nor a slash — this name reaches a path", !addNameOK("a/b"));
+  ok("nor a leading dash", !addNameOK("-x"));
+  ok("nor a leading dot, which would hide it", !addNameOK(".x"));
+  ok("64 characters is the ceiling", addNameOK("a".repeat(64)) && !addNameOK("a".repeat(65)));
+  eq("an empty box is not yet an error", addNameProblem(""), "");
+  ok("a bad character is explained", /letters, digits/.test(addNameProblem("a b")));
+  eq("a name in use is refused by name", addNameProblem("work"), "work already exists");
+}
+
+console.log("16. the panel says only what it knows");
+{
+  freshStorage(); stubDom();
+  const a = loadAdd({ PROFILES:[{ name:"work" }] });
+  const H = a.fns.addHTML;
+  ok("it starts as an invitation", H().includes('data-add="open"'));
+
+  a.set({ ADD:{ state:"naming", name:"spare" } });
+  ok("a good name can be started", !/data-add="start"[^>]*disabled/.test(H()));
+  a.set({ ADD:{ state:"naming", name:"work" } });
+  ok("a taken one cannot", /disabled/.test(H()));
+  ok("and the panel says why", H().includes("work already exists"));
+
+  a.set({ ADD:{ state:"running", name:"spare", url:null, needsCode:false, log:"" } });
+  ok("before the URL arrives it does not pretend to have one",
+     !H().includes('class="signin"') && H().includes("starting"));
+  ok("and it does not ask for a code it has not been prompted for",
+     !H().includes('id="addCode"'));
+  a.set({ ADD:{ state:"running", url:"https://claude.ai/x?state=1", needsCode:true } });
+  ok("the sign-in link is offered", H().includes('href="https://claude.ai/x?state=1"'));
+  ok("the code field appears only once prompted", H().includes('id="addCode"'));
+  ok("and it opens in a new tab, safely",
+     H().includes('target="_blank"') && H().includes('rel="noopener"'));
+
+  a.set({ ADD:{ state:"failed", name:"spare", error:"the sign-in did not complete" } });
+  ok("a failure is reported", H().includes("was not created"));
+  ok("with the reason", H().includes("the sign-in did not complete"));
+  ok("it says nothing was changed", H().includes("Nothing was changed"));
+  ok("and offers another go", H().includes('data-add="retry"'));
+  ok("a dead job asks for no code", !H().includes('id="addCode"'));
+
+  /* The URL comes out of a subprocess's stdout, and the name out of a text box.
+     Neither is trusted markup. */
+  a.set({ ADD:{ state:"running", name:'x" onload="boom', url:'https://a/"><img src=x>',
+                needsCode:false, log:"" } });
+  ok("the URL is escaped", !H().includes("<img"));
+  ok("the name is escaped", !H().includes('onload="boom'));
 }
 
 console.log("");

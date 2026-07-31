@@ -308,6 +308,117 @@
   .others{display:grid;gap:13px;grid-template-columns:repeat(auto-fit,minmax(236px,1fr))}
   .card{border-radius:14px;padding:12px}
 
+  /* ── adding an account ──────────────────────────────────────────────────
+     A ghost slot in the same grid as the cards, because that is what it turns
+     into. It carries no field and no light: it is not an account yet, and
+     dressing it like one would promise something that has not happened. */
+  /* Its own row beneath the cards, at one card's width — not a cell in the grid.
+     It is not an account yet, and stretching it across the row would say it was. */
+  #addSlot{display:flex;margin-top:13px}
+  #addSlot > *{width:100%;max-width:330px}
+  .addcard{min-height:92px;border-radius:14px;padding:12px;
+    border:1px dashed var(--line-2);background:transparent;color:var(--fg-3);
+    font:inherit;font-size:12.5px;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:6px;cursor:pointer;
+    transition:color .25s,border-color .25s,background .25s}
+  .addcard:hover{color:var(--fg-2);border-color:var(--line-2);
+    background:color-mix(in srgb,var(--fg) 3%,transparent)}
+  .addcard .ms{font-size:20px}
+  .addpanel{border-radius:14px;padding:12px;border:1px solid var(--line-2);
+    background:var(--raised);display:flex;flex-direction:column;gap:9px}
+  .addpanel .ahd{display:flex;align-items:center;gap:7px;font-family:var(--mono);
+    font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--fg-3)}
+  .addpanel .ahd .ms{font-size:13px}
+  .addpanel .ahd .x{margin-left:auto}
+  .addpanel input{width:100%;background:var(--ground);color:var(--fg);
+    border:1px solid var(--line-2);border-radius:8px;padding:7px 9px;
+    font-family:var(--mono);font-size:12.5px}
+  .addpanel input:focus{outline:none;border-color:var(--action)}
+  .addpanel .row{display:flex;gap:7px;align-items:center}
+  .addpanel .hint{font-size:11px;line-height:1.45;color:var(--fg-3)}
+  .addpanel .hint b{color:var(--fg-2);font-weight:600}
+  .addpanel .bad{color:var(--crit)}
+  .addpanel .go{flex:none;border:1px solid color-mix(in srgb,var(--action) 55%,transparent);
+    background:color-mix(in srgb,var(--action) 12%,transparent);color:var(--action);
+    border-radius:999px;padding:6px 13px;font:inherit;font-size:12px;font-weight:600;
+    cursor:pointer;display:inline-flex;align-items:center;gap:5px}
+  .addpanel .go[disabled]{opacity:.45;cursor:default}
+  .addpanel .go .ms{font-size:14px}
+  .addpanel .ghost{flex:none;border:1px solid var(--line-2);background:transparent;
+    color:var(--fg-2);border-radius:999px;padding:6px 11px;font:inherit;font-size:12px;
+    cursor:pointer}
+  /* The sign-in link is the one thing that must be unmissable while a job runs. */
+  .addpanel .signin{display:flex;align-items:center;gap:6px;text-decoration:none;
+    border-radius:9px;padding:8px 10px;font-family:var(--mono);font-size:11.5px;
+    color:var(--action);border:1px solid color-mix(in srgb,var(--action) 50%,transparent);
+    background:color-mix(in srgb,var(--action) 10%,transparent)}
+  .addpanel .tail{font-family:var(--mono);font-size:10px;line-height:1.5;
+    color:var(--fg-3);white-space:pre-wrap;word-break:break-word;max-height:74px;
+    overflow:auto;border-top:1px solid var(--line);padding-top:7px}
+  .addpanel .chk{display:flex;align-items:center;gap:7px;font-size:11.5px;
+    color:var(--fg-2);cursor:pointer}
+  /* Native, but on-palette: an unstyled checkbox picks up the OS accent, and a
+     saturated blue is not a colour this page uses on a control. */
+  .addpanel .chk input{width:13px;height:13px;accent-color:var(--action)}
+
+  /* ── metrics ────────────────────────────────────────────────────────── */
+  .wm{display:inline-flex;align-items:baseline;font-family:var(--mono);line-height:1;flex:none}
+  .wm .n{font-size:14px;font-weight:700;letter-spacing:-.05em;color:var(--fg)}
+  .wm .u{font-size:10px;font-weight:500;color:var(--fg-3);margin-left:.5px}
+  .hero .wm .n{font-size:17px} .hero .wm .u{font-size:12px}
+  .peers{display:flex;align-items:flex-end;gap:11px}
+  .peers .cell{display:flex;flex-direction:column;gap:2px;min-width:0}
+  .peers .cell .k{font-family:var(--mono);font-size:8px;letter-spacing:.15em;
+    text-transform:uppercase;color:var(--fg-3);white-space:nowrap}
+  .peers .cell .v{font-family:var(--mono);font-weight:700;letter-spacing:-.045em;line-height:1;
+    font-variant-numeric:tabular-nums;transition:color .6s}
+  .peers .cell.lead .v{font-size:22px}
+  .peers .cell.follow .v{font-size:13px;color:var(--fg-2)}
+  .hero .peers .cell.lead .v{font-size:36px;letter-spacing:-.05em}
+  .hero .peers .cell.follow .v{font-size:16px}
+  .peers .gap{margin-left:auto}
+  .lanes{display:grid;gap:3px;margin-top:9px}
+  .hero .lanes{gap:4px;margin-top:12px}
+  .lane{display:grid;grid-template-columns:34px 1fr;gap:7px;align-items:center}
+  .lane .lk{font-family:var(--mono);font-size:7.5px;letter-spacing:.13em;text-transform:uppercase;
+    color:var(--fg-3);text-align:right}
+  .lane .lt{position:relative;height:5px;border-radius:3px;
+    background:color-mix(in srgb,var(--fg) 9%,transparent);overflow:hidden}
+  .hero .lane .lt{height:7px;border-radius:4px}
+  .lane .lt i{position:absolute;left:0;top:0;bottom:0;border-radius:inherit;width:0;
+    transition:width .8s cubic-bezier(.2,.8,.2,1),background .6s}
+  /* The burn rate, said out loud. The two lanes above already show it as the gap
+     between them; this names the gap and extrapolates it. Absent entirely until
+     there is enough history to divide by, so a fresh install never shows a
+     half-answer. */
+  .trend{display:flex;align-items:center;gap:6px;margin-top:7px;
+    font-family:var(--mono);font-size:9.5px;letter-spacing:.02em;color:var(--fg-3);
+    font-variant-numeric:tabular-nums}
+  .hero .trend{font-size:10.5px;margin-top:10px}
+  .trend .rate{color:var(--fg-2);font-weight:600}
+  .trend .hit{margin-left:auto;display:flex;align-items:center;gap:4px}
+  /* Severity here is distance to the limit measured in TIME rather than percent —
+     the same axis as everywhere else, so it may wear the same colours. */
+  .trend .hit.s-warn{color:var(--warn)} .trend .hit.s-crit{color:var(--crit)}
+  /* Taller than it is wide would be a chart; this is a shape cue, so it is sized
+     to make a real climb legible at a glance and given a baseline so 0 has a
+     place to sit. Its stroke is one step brighter than the caption around it —
+     a line nobody can see is decoration, which this page does not do. */
+  .trend .spark{flex:none;width:56px;height:18px;color:var(--fg-2);
+    border-bottom:1px solid color-mix(in srgb,var(--fg) 11%,transparent)}
+  .trend .spark polyline{fill:none;stroke:currentColor;stroke-width:1.5;
+    stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+  .trend .spark circle{fill:currentColor}
+  /* The recommendation. It is an action ("use this one next"), so it takes the
+     action colour — as an outline, because a saturated fill on a control is not
+     something this page does. */
+  .nextchip{display:inline-flex;align-items:center;gap:4px;flex:none;
+    padding:2px 7px 2px 5px;border-radius:999px;font-family:var(--mono);font-size:8.5px;
+    letter-spacing:.14em;text-transform:uppercase;color:var(--action);
+    border:1px solid color-mix(in srgb,var(--action) 45%,transparent);
+    background:color-mix(in srgb,var(--action) 9%,transparent)}
+  .nextchip .ms{font-size:11px}
+  .hkick .nextchip{margin-left:8px;vertical-align:1px}
   .q2{margin-top:10px;padding-top:9px;border-top:1px solid var(--line);display:flex;
     align-items:center;gap:8px;font-family:var(--mono);font-size:10.5px;color:var(--fg-2)}
   .q2 .wmini{font-size:10.5px;font-weight:700;color:var(--fg-3);flex:none}
@@ -710,6 +821,7 @@
     <div id="heroSlot"></div>
     <div class="stagelbl" id="othersLbl" hidden>other profiles</div>
     <div class="others" id="othersSlot"></div>
+    <div id="addSlot"></div>
   </div>
 
   <div class="logpanel">
@@ -1219,6 +1331,199 @@
       <div class="skline" style="margin-top:12px;height:6px"></div></div>`).join("");
   };
 
+  /* ═══════════ add an account ═════════════════════════════════════════
+     `claudius add` waits on a human in a browser, so the sidecar runs it as a
+     job and this is the panel that drives it. Two flows exist upstream — the
+     browser hands the terminal the login, or the site shows a code to paste —
+     and the sidecar collapses them into one by watching for the credentials to
+     land. So there is exactly one interactive element here, and it is optional:
+     the code field. Everything else is a link to open and a state to report.
+
+     The panel never decides that a sign-in worked. Only the sidecar does, from
+     the filesystem, and only its terminal state is trusted — which is also why
+     the profile list is not reloaded until then.
+     ═══════════════════════════════════════════════════════════════════════ */
+  const ADD_IDLE = { state:"idle", id:null, name:"", url:null, needsCode:false,
+                     log:"", error:null, activate:false, busy:false };
+  let ADD = { ...ADD_IDLE };
+  let addPollT = null;
+  const ADD_LIVE = ["running","stopping"];
+
+  /* Mirrors the sidecar's valid_profile_name?, which mirrors the CLI's
+     sanitize_profile_name. Three copies is two too many, but the alternative is a
+     round trip before the first keystroke is judged — so the rule is stated in
+     one line in each place and tested in two. */
+  const addNameOK = n => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(n) && n.length <= 64;
+  function addNameProblem(n){
+    if (!n) return "";
+    if (!addNameOK(n)) return "letters, digits, dot, dash and underscore only";
+    if (PROFILES.some(p => p.name === n)) return `${n} already exists`;
+    return "";
+  }
+
+  function addHTML(){
+    if (ADD.state === "idle")
+      return `<button class="addcard" data-add="open">
+        <span class="ms">add</span>add an account</button>`;
+    if (ADD.state === "naming"){
+      const problem = addNameProblem(ADD.name);
+      const ready = ADD.name && !problem;
+      return `<div class="addpanel">
+        <div class="ahd"><span class="ms">add</span>new account
+          <button class="icobtn x" data-add="close" title="close"
+            aria-label="close"><span class="ms">close</span></button></div>
+        <input id="addName" placeholder="a name for it, e.g. work"
+          value="${esc(ADD.name)}" autocomplete="off" spellcheck="false">
+        <div class="hint ${problem ? "bad" : ""}">${problem
+          || "You'll sign in with Anthropic in a new tab. Nothing changes until it works."}</div>
+        <label class="chk"><input type="checkbox" id="addActivate"
+          ${ADD.activate ? "checked" : ""}>make it the global account too</label>
+        <div class="row"><button class="go" data-add="start" ${ready ? "" : "disabled"}
+          ><span class="ms">login</span>Start sign-in</button></div>
+      </div>`;
+    }
+    if (ADD_LIVE.includes(ADD.state)){
+      return `<div class="addpanel">
+        <div class="ahd"><span class="sp"></span>signing in as ${esc(ADD.name)}</div>
+        ${ADD.url
+          ? `<a class="signin" href="${esc(ADD.url)}" target="_blank" rel="noopener"
+               ><span class="ms">open_in_new</span>Open the sign-in page</a>`
+          : `<div class="hint">starting…</div>`}
+        <div class="hint">If that page shows you a <b>code</b>, paste it here. If it
+          just says you're done, there's nothing to do — this finishes on its own.</div>
+        ${ADD.needsCode ? `<div class="row">
+          <input id="addCode" placeholder="paste the code" autocomplete="off"
+            spellcheck="false">
+          <button class="go" data-add="code"><span class="ms">send</span>Send</button>
+        </div>` : ""}
+        ${ADD.log ? `<div class="tail">${esc(ADD.log.slice(-600))}</div>` : ""}
+        <div class="row"><button class="ghost" data-add="cancel">Cancel</button></div>
+      </div>`;
+    }
+    /* terminal, and not done — done never renders, the new card replaces it */
+    return `<div class="addpanel">
+      <div class="ahd"><span class="ms">error</span>${esc(ADD.name)} was not created
+        <button class="icobtn x" data-add="close" title="close"
+          aria-label="close"><span class="ms">close</span></button></div>
+      <div class="hint bad">${esc(ADD.error || "the sign-in did not complete")}</div>
+      <div class="hint">Nothing was changed. Your other accounts are untouched.</div>
+      <div class="row"><button class="go" data-add="retry"
+        ><span class="ms">refresh</span>Try again</button></div>
+    </div>`;
+  }
+
+  function paintAdd(){
+    const slot = $("#addSlot");
+    if (!slot) return;
+    /* Don't redraw under someone's fingers: a repaint on every poll would wipe a
+       half-typed code and steal the caret. */
+    const typing = document.activeElement;
+    const keep = typing && (typing.id === "addName" || typing.id === "addCode")
+      ? { id:typing.id, value:typing.value, at:typing.selectionStart } : null;
+    slot.innerHTML = addHTML();
+    if (keep){
+      const el = $("#" + keep.id);
+      if (el){
+        el.value = keep.value;
+        el.focus();
+        try { el.setSelectionRange(keep.at, keep.at); } catch (e) {}
+      }
+    }
+  }
+
+  function addReset(){
+    clearInterval(addPollT); addPollT = null;
+    ADD = { ...ADD_IDLE };
+    paintAdd();
+  }
+
+  async function addStart(){
+    const name = ($("#addName") || {}).value || ADD.name;
+    ADD.activate = !!(($("#addActivate") || {}).checked);
+    if (addNameProblem(name) || !name) return;
+    ADD.name = name; ADD.busy = true;
+    try{
+      const r = await fetch(`/api/add?profile=${encodeURIComponent(name)}${
+        ADD.activate ? "&activate=1" : ""}`,
+        { method:"POST", headers:{ "X-CSRF-Token":TOKEN } });
+      const d = await r.json();
+      if (!r.ok || d.ok === false) throw new Error(d.error || "HTTP " + r.status);
+      Object.assign(ADD, { state:d.state, id:d.id, url:d.url, needsCode:d.needs_code,
+                           log:d.log || "", error:null, busy:false });
+      log("sys", `signing in a new account — <b>${esc(name)}</b>`, "");
+      paintAdd();
+      clearInterval(addPollT);
+      addPollT = setInterval(addPoll, 1000);
+    }catch(e){
+      ADD.busy = false;
+      log("err", `could not start the sign-in — ${esc(e.message)}`);
+      toast(e.message, "error", true);
+      ADD.state = "naming";
+      paintAdd();
+    }
+  }
+
+  async function addPoll(){
+    try{
+      const r = await fetch("/api/add/status", { cache:"no-store" });
+      const d = await r.json();
+      if (!r.ok || d.ok === false) throw new Error(d.error || "HTTP " + r.status);
+      const was = ADD.state;
+      Object.assign(ADD, { state:d.state, url:d.url || ADD.url,
+                           needsCode:d.needs_code, log:d.log || "", error:d.error });
+      if (ADD_LIVE.includes(d.state)){ paintAdd(); return; }
+      clearInterval(addPollT); addPollT = null;
+      if (d.state === "done"){
+        log("switch", `added <b>${esc(d.name)}</b>${
+          d.activated ? " and made it the global account" : ""}`, "");
+        toast(`${d.name} is ready`, "check");
+        ADD = { ...ADD_IDLE };
+        /* the sidecar hands back the list it read AFTER cleaning up, so this is
+           the first moment the new account is safe to draw */
+        if (Array.isArray(d.profiles)) PROFILES = order(d.profiles);
+        await loadHistory(true);
+        renderAll(); paintResets();
+        return;
+      }
+      if (was !== d.state)
+        log("err", `<b>${esc(ADD.name)}</b> was not created — ${esc(ADD.error || d.state)}`);
+      paintAdd();
+    }catch(e){
+      clearInterval(addPollT); addPollT = null;
+      ADD.state = "failed";
+      ADD.error = e.message;
+      paintAdd();
+    }
+  }
+
+  async function addSendCode(){
+    const el = $("#addCode");
+    const code = (el && el.value || "").trim();
+    if (!code) return;
+    try{
+      const r = await fetch("/api/add/code", { method:"POST",
+        headers:{ "X-CSRF-Token":TOKEN, "Content-Type":"application/json" },
+        body:JSON.stringify({ code }) });
+      const d = await r.json();
+      if (!r.ok || d.ok === false) throw new Error(d.error || "HTTP " + r.status);
+      if (el) el.value = "";
+      /* The code is never logged — not here, not in the sidecar. Only that one
+         was sent. */
+      log("sys", "sent the sign-in code", "");
+    }catch(e){
+      toast(e.message, "error", true);
+    }
+  }
+
+  async function addCancel(){
+    clearInterval(addPollT); addPollT = null;
+    try{
+      await fetch("/api/add/cancel", { method:"POST", headers:{ "X-CSRF-Token":TOKEN } });
+      log("sys", `cancelled the sign-in for <b>${esc(ADD.name)}</b>`, "");
+    }catch(e){ /* it may already be gone; the reset below is what matters */ }
+    addReset();
+  }
+
   /* ═══════════ the room ═══════════════════════════════════════════════ */
   let ambLayer = 0, ambFor = null;
   function setAmbient(p, immediate){
@@ -1326,7 +1631,7 @@
     if (!PROFILES.length){
       $("#heroSlot").innerHTML =
         `<div class="sk"><div style="color:var(--fg-2);font-size:14px">No profiles found in
-         <span class="root">{{ROOT}}</span>. Add one with
+         <span class="root">{{ROOT}}</span>. Add one below, or with
          <span style="font-family:var(--mono)">claudius add</span>.</div></div>`;
       $("#othersLbl").hidden = true;
       $("#othersSlot").innerHTML = "";
@@ -1371,7 +1676,7 @@
   /* paintSessions is in here because switching the active account changes the
      shape of every copied command — the active one takes bare `claude`. */
   function renderAll(){
-    renderStage(); paintPal(); paintSessions();
+    renderStage(); paintPal(); paintSessions(); paintAdd();
     setAmbient(activeProfile() || PROFILES[0]);
   }
 
@@ -2023,12 +2328,40 @@
     if (cp) return copyRun(cp.dataset.copy);
     const sel = e.target.closest("button[data-sel]");
     if (sel) return activate(sel.dataset.sel);
+    /* Qualified with `button` for the reason at the top of this file: a bare
+       [data-add] would also match <html> if the token ever moved there. */
+    const ad = e.target.closest("button[data-add]");
+    if (ad){
+      const what = ad.dataset.add;
+      if (what === "open"){ ADD.state = "naming"; paintAdd(); $("#addName").focus(); return; }
+      if (what === "close" || what === "retry"){
+        const retry = what === "retry" && ADD.name;
+        const name = ADD.name;
+        addReset();
+        if (retry){ ADD.state = "naming"; ADD.name = name; paintAdd(); $("#addName").focus(); }
+        return;
+      }
+      if (what === "start")  return addStart();
+      if (what === "code")   return addSendCode();
+      if (what === "cancel") return addCancel();
+      return;
+    }
 
     if (!e.target.closest(".kmenu,.palpop")) closeMenus();
   });
 
   document.addEventListener("input", e => {
     if (e.target.id === "palQ"){ palQ = e.target.value.trim(); $("#palList").innerHTML = palRows(); }
+    /* Judged as you type — the name is the one thing that can be wrong before
+       anything irreversible happens, so it should be wrong quietly and early. */
+    if (e.target.id === "addName"){ ADD.name = e.target.value.trim(); paintAdd(); }
+  });
+  /* Enter submits whichever field you are in. Both are one-line answers, and
+     reaching for the mouse to confirm a single word is a waste of a hand. */
+  document.addEventListener("keydown", e => {
+    if (e.key !== "Enter") return;
+    if (e.target.id === "addName" && ADD.state === "naming"){ e.preventDefault(); addStart(); }
+    if (e.target.id === "addCode"){ e.preventDefault(); addSendCode(); }
   });
   /* Both filters reset the cursor: it indexes into what is visible, and what is
      visible just changed underneath it. */

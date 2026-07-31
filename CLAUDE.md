@@ -67,6 +67,16 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   sentence. The ranking rules are documented above `next_json` — change them
   there, never in the page, or the terminal and the dashboard will start
   recommending different accounts.
+- `POST /api/add` starts a background job; `GET /api/add/status` reports
+  `{state, url, needs_code, log, error, profiles?}` where state is
+  `running`/`stopping`/`done`/`failed`/`expired`/`cancelled`. Publish a terminal
+  state LAST, after cleanup — the page reloads the profile list the moment it sees
+  one, and a half-made profile still on disk would read as a real account.
+  `stopping` is not terminal and blocks a new job. Success is decided from the
+  FILESYSTEM (credentials appearing), never by scraping the child's output.
+- `POST /api/add/code` is write-only. The authorization code goes to the child's
+  stdin and must never reach a response, a log line or the page — it arrives in
+  the request BODY, not the query string, and is scrubbed from the log tail.
 - `dashboard.html` → the sidecar substitutes `{{TOKEN}}` and `{{ROOT}}` only.
   Keep the file valid standalone HTML.
 - Handle usage values above 100 and the case of no active profile. Both are real.
@@ -78,8 +88,14 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 - Never put a token, credential or refresh token in an API response, log line,
   error message or test output.
 - Require `X-CSRF-Token` on every mutating endpoint.
-- Shell back into the bash CLI for mutations. Never reimplement `activate` or
-  `refresh` in Ruby or JS.
+- Shell back into the bash CLI for mutations. Never reimplement `activate`,
+  `refresh` or `add` in Ruby or JS.
+- Spawn a long-running child in its OWN process group and signal the group.
+  `claudius add` runs `claude auth login` as a child; killing only the bash pid
+  leaves that child alive holding the stdin pipe.
+- A pipe on the child's stdin, never a pty: a pty echoes, which would put a pasted
+  authorization code into the log the page displays. `claude auth login` needs no
+  TTY — verified — so there is no reason to reach for one.
 
 ## Dashboard
 
@@ -121,7 +137,7 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 - Two accounts running concurrently on macOS is observed working on claude
   2.1.220. Still unobserved, so describe as reasoned: the fallback for a CLI too
   old to namespace the Keychain item, and the refusal paths.
-- Run `bash tests/dashboard.sh` (117 assertions, ~1s) after any change to
+- Run `bash tests/dashboard.sh` (143 assertions, ~1s) after any change to
   `dashboard.html`. It slices the page's `<script>` blocks by their `═══ banner ═══`
   section comments and runs the pure logic under node against stubbed storage and
   DOM. Renaming a banner breaks extraction loudly and on purpose — fix the test's
@@ -134,6 +150,13 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   Read-only: it never clicks anything that mutates. It skips when node or Chromium
   is missing, when its port is taken (probably the user's dashboard), and
   per-assertion when the pool lacks the shape being checked.
+- Run `bash tests/add.sh` (45 assertions, ~60s) after any change to the add job
+  model, its endpoints or `cmd_add`. It starts a real sidecar whose `--script` is a
+  stub standing in for `add` alone (everything else goes to the real CLI), so every
+  branch — the code channel, the newline the sidecar supplies itself, the reaper,
+  cancellation, shutdown — is driven without a real sign-in. It is also where the
+  security rules are enforced rather than merely stated: every response is checked
+  for the pasted code and for a token. Skips when the port is taken.
 - Run `bash tests/history.sh` (40 assertions, ~15s) after any change to the
   `.usage.log` format, `usage_history_json` or `next_json`. Throwaway `HOME`,
   every sample written by the test, no API call — the rate segmentation and the
