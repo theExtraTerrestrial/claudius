@@ -128,22 +128,43 @@ Concurrent accounts therefore work on Linux/WSL, not on macOS.
 claudius serve --open
 ```
 
-Serves a self-contained page on `127.0.0.1` **only** (never the LAN) with a card
-per account: identity, subscription badge, 5h/7d usage bars, **reset times**,
-cache age, and per-card **Refresh** / **Activate** buttons. Mutations shell back
-into the CLI so the terminal and the dashboard always agree. No account tokens are
+Serves a page on `127.0.0.1` **only** (never the LAN). Mutations shell back into
+the CLI so the terminal and the dashboard always agree, and no account tokens are
 ever included in any API response.
 
-- **Reset times** show under each usage bar. Click any reset line (or the
-  **reset:** button in the toolbar) to cycle how it is displayed: live
-  **countdown** → absolute **clock** → **total** remaining. The choice is
-  remembered in the browser.
-- **Refresh is not free.** Each **Refresh** / **Refresh all** spends a small Haiku
-  API call (and may renew a token) to read live limits — the dashboard says so.
-  **Auto-poll** only re-reads the local cache, which is free; it never refreshes on
-  a timer.
+**The global account gets a hero.** Both windows at full size, its usage figure
+and its reset time as equals — because at 12% the percentage is the story and at
+100% only the reset is. The other profiles sit below as compact cards showing the
+5h window plus a five-pip band for the 7d. Press **Use** on one and it flies into
+the hero slot as the switch lands.
+
+- **Usage and reset are one reading.** Each window shows both figures on one
+  baseline, plus two lanes: how much you've used, and how far through the window
+  you are. The gap between them is your burn rate. When a window hits its ceiling
+  the block gives itself over to one fact — when it clears.
+- **Every profile gets its own animated field**, one of eight pure-CSS
+  backgrounds, and the page's ambient background takes the *active* profile's
+  field. The motion is a reading, not decoration: it speeds up as a limit
+  approaches and **stops dead** at the ceiling. Use the kebab to pin or shuffle a
+  card's style if two land on the same one.
+- **Reading live limits is not free.** Each one spends a small Haiku API call (and
+  may renew a token); the price rides on the control that spends it, and the
+  footer keeps a running tally. **Watch cache** only re-reads the local cache on a
+  30-second ring — that part is free and never calls the API.
+- **The palette** (the `GLOBAL ·` chip) is one place to switch accounts, read all
+  limits, and set preferences: reset display (**countdown** / **clock** /
+  **total**), grey bias, and severity intensity. Reset display is remembered in
+  the browser.
+- **The session log** records everything the page did since you opened it —
+  every live read with its result, every free cache re-read, every switch — each
+  row priced, so the cost history sits beside the tally.
 - The page markup lives in `dashboard.html` (edit it directly); the sidecar reads
-  that file and injects only a CSRF token + the profile root at serve time.
+  that file and injects only a CSRF token + the profile root at serve time. Fonts
+  and icons come from Google Fonts, so the page wants a network connection. Its
+  header comment carries the design rules — read them before editing.
+
+The dashboard is a **monitor with a few actions**, not a full front-end: `add`,
+`remove` and `statusline` stay CLI-only for now. See `.scratch/front_end/`.
 
 ## Status line
 
