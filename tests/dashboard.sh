@@ -59,7 +59,7 @@ marks.each_with_index do |(name, at), k|
   sections[name] = lines[(close + 1)...stop].join
 end
 
-want = ['linked sessions']
+want = ['linked sessions', 'history']
 missing = want.reject { |w| sections.key?(w) }
 abort "banner section(s) not found: #{missing.join(', ')} (have: #{sections.keys.join(' | ')})" if missing.any?
 
@@ -90,6 +90,7 @@ pieces = {
 abort 'chunk not found: BIASES' if pieces['biases'].nil?
 pieces.each { |k, v| File.write(File.join(work, "piece-#{k}.js"), v) }
 File.write(File.join(work, 'sec-sessions.js'), sections['linked sessions'])
+File.write(File.join(work, 'sec-history.js'), sections['history'])
 RB
 [[ $? -eq 0 ]] || { printf 'extraction failed\n' >&2; exit 1; }
 
@@ -176,6 +177,38 @@ function loadSessions(state){
   if (state) api.set(state);
   return api;
 }
+
+// The history section, wrapped the same way. HIST and NEXT are private to the
+// page, and everything here has to hold against a shape the real data can
+// actually take — including a profile with no history at all, which is what a
+// fresh install looks like for its first few minutes.
+function loadHistory(state){
+  const src = [
+    read("piece-esc.js"),
+    "let ACTIVE = '';",
+    "const activeName = () => ACTIVE;",
+    read("sec-history.js"),
+  ].join("\n");
+  const tail = `
+    return {
+      fns:{ etaText, etaSev, sparkSVG, trendHTML, nextChip, histOf, nextPick },
+      set:(o) => {
+        if ('HIST' in o) HIST = o.HIST;
+        if ('NEXT' in o) NEXT = o.NEXT;
+        if ('ACTIVE' in o) ACTIVE = o.ACTIVE;
+      },
+    };`;
+  const api = new Function(`${src}\n${tail}`)();
+  if (state) api.set(state);
+  return api;
+}
+
+// A sample series: n points, `mins` apart, ending now, value from f(i).
+const series = (n, f, mins = 2) => {
+  const now = Math.floor(Date.now() / 1000);
+  return Array.from({ length:n }, (_, i) =>
+    [now - (n - 1 - i) * mins * 60, f(i), f(i)]);
+};
 
 const S = (over) => Object.assign({
   id:"11111111-1111-1111-1111-111111111111", cwd:"/home/a/claudius", short:"~/claudius",
@@ -420,6 +453,81 @@ console.log("10. storage that throws on every call");
     const a = loadSessions({ SESSIONS:[S()] });
     ok("the sessions section still loads", a.fns.sessWho() === "");
   } catch (e) { ok("the sessions section still loads", false); }
+}
+
+console.log("11. usage history reads as time, not just numbers");
+{
+  freshStorage(); stubDom();
+  const a = loadHistory();
+  const { etaText, etaSev } = a.fns;
+  const now = Math.floor(Date.now() / 1000);
+  eq("a ceiling an hour out is a countdown", etaText(now + 3600), "in 60m");
+  ok("one already reached is not a negative countdown", etaText(now - 5) === "any moment");
+  ok("further out it becomes a clock time", /^at \d/.test(etaText(now + 4 * 3600)));
+  ok("beyond today it carries a date",
+     /^[A-Z][a-z]{2} \d/.test(etaText(now + 3 * 86400)));
+  eq("under an hour is critical", etaSev(now + 1800), "crit");
+  eq("under three hours is a warning", etaSev(now + 2 * 3600), "warn");
+  eq("further out wears no severity colour", etaSev(now + 9 * 3600), "");
+}
+
+console.log("12. the sparkline is never auto-ranged");
+{
+  freshStorage(); stubDom();
+  const { sparkSVG } = loadHistory().fns;
+  const flatLow = sparkSVG(series(10, () => 3), 1);
+  const flatHigh = sparkSVG(series(10, () => 90), 1);
+  ok("a flat 3% and a flat 90% do not draw the same line", flatLow !== flatHigh);
+  ok("the 90% line sits above the 3% one",
+     parseFloat(flatHigh.match(/points="[\d.]+,([\d.]+)/)[1])
+     < parseFloat(flatLow.match(/points="[\d.]+,([\d.]+)/)[1]));
+  eq("two points are not a chart", sparkSVG(series(2, () => 10), 1), "");
+  eq("no samples at all draw nothing", sparkSVG(null, 1), "");
+  ok("a value past the ceiling stays inside the box",
+     sparkSVG(series(4, () => 140), 1).match(/,(-?[\d.]+)/g)
+       .every(m => parseFloat(m.slice(1)) >= 0));
+  ok("a gap in one window does not break the other",
+     sparkSVG([[1, null, 5], [2, null, 6], [3, null, 7]], 2).includes("polyline"));
+}
+
+console.log("13. the trend caption, and what it says when it cannot say much");
+{
+  freshStorage(); stubDom();
+  const now = Math.floor(Date.now() / 1000);
+  const a = loadHistory({ HIST:{
+    busy:   { rate5:12.34, eta5:now + 1800, samples:series(8, i => i * 10) },
+    idle:   { rate5:0.2, eta5:null, samples:series(8, () => 5) },
+    rising: { rate5:9, eta5:null, samples:series(8, i => i) },
+    thin:   { rate5:null, eta5:null, samples:series(2, () => 5) },
+  }});
+  const t = a.fns.trendHTML;
+  ok("a profile with no history gets no caption at all", t("unknown", 5) === "");
+  ok("nor does one with too little to measure or draw", t("thin", 5) === "");
+  ok("the rate is signed", t("busy", 5).includes("+12.3%/h"));
+  ok("a projected ceiling is marked for the ticker to update",
+     t("busy", 5).includes(`data-eta="${now + 1800}"`));
+  ok("and takes the severity of how soon it lands", t("busy", 5).includes("s-crit"));
+  ok("a flat account is holding", t("idle", 5).includes("holding"));
+  ok("a climbing one that resets in time says so", t("rising", 5).includes("clears first"));
+  ok("no projection means no flag", !t("rising", 5).includes("data-eta"));
+}
+
+console.log("14. the recommendation chip");
+{
+  freshStorage(); stubDom();
+  const a = loadHistory({ NEXT:{ pick:"spare", reason:"88% left on the 7d" },
+                          ACTIVE:"work" });
+  ok("only the recommended profile is chipped", a.fns.nextChip("work") === "");
+  ok("the recommendation says to use it", a.fns.nextChip("spare").includes("use next"));
+  ok("it carries the reason", a.fns.nextChip("spare").includes("88% left on the 7d"));
+  a.set({ ACTIVE:"spare" });
+  ok("when you are already on it, it says that instead",
+     a.fns.nextChip("spare").includes("you're on it"));
+  a.set({ NEXT:{ pick:"spare", reason:'<img src=x onerror="boom">' } });
+  ok("the reason is escaped before it lands in an attribute",
+     !a.fns.nextChip("spare").includes("<img"));
+  a.set({ NEXT:null });
+  ok("nothing is chipped before the ranking has loaded", a.fns.nextChip("spare") === "");
 }
 
 console.log("");

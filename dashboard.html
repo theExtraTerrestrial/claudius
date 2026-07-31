@@ -308,32 +308,6 @@
   .others{display:grid;gap:13px;grid-template-columns:repeat(auto-fit,minmax(236px,1fr))}
   .card{border-radius:14px;padding:12px}
 
-  /* ── metrics ────────────────────────────────────────────────────────── */
-  .wm{display:inline-flex;align-items:baseline;font-family:var(--mono);line-height:1;flex:none}
-  .wm .n{font-size:14px;font-weight:700;letter-spacing:-.05em;color:var(--fg)}
-  .wm .u{font-size:10px;font-weight:500;color:var(--fg-3);margin-left:.5px}
-  .hero .wm .n{font-size:17px} .hero .wm .u{font-size:12px}
-  .peers{display:flex;align-items:flex-end;gap:11px}
-  .peers .cell{display:flex;flex-direction:column;gap:2px;min-width:0}
-  .peers .cell .k{font-family:var(--mono);font-size:8px;letter-spacing:.15em;
-    text-transform:uppercase;color:var(--fg-3);white-space:nowrap}
-  .peers .cell .v{font-family:var(--mono);font-weight:700;letter-spacing:-.045em;line-height:1;
-    font-variant-numeric:tabular-nums;transition:color .6s}
-  .peers .cell.lead .v{font-size:22px}
-  .peers .cell.follow .v{font-size:13px;color:var(--fg-2)}
-  .hero .peers .cell.lead .v{font-size:36px;letter-spacing:-.05em}
-  .hero .peers .cell.follow .v{font-size:16px}
-  .peers .gap{margin-left:auto}
-  .lanes{display:grid;gap:3px;margin-top:9px}
-  .hero .lanes{gap:4px;margin-top:12px}
-  .lane{display:grid;grid-template-columns:34px 1fr;gap:7px;align-items:center}
-  .lane .lk{font-family:var(--mono);font-size:7.5px;letter-spacing:.13em;text-transform:uppercase;
-    color:var(--fg-3);text-align:right}
-  .lane .lt{position:relative;height:5px;border-radius:3px;
-    background:color-mix(in srgb,var(--fg) 9%,transparent);overflow:hidden}
-  .hero .lane .lt{height:7px;border-radius:4px}
-  .lane .lt i{position:absolute;left:0;top:0;bottom:0;border-radius:inherit;width:0;
-    transition:width .8s cubic-bezier(.2,.8,.2,1),background .6s}
   .q2{margin-top:10px;padding-top:9px;border-top:1px solid var(--line);display:flex;
     align-items:center;gap:8px;font-family:var(--mono);font-size:10.5px;color:var(--fg-2)}
   .q2 .wmini{font-size:10.5px;font-weight:700;color:var(--fg-3);flex:none}
@@ -968,6 +942,105 @@
     return a.concat(r);
   };
 
+  /* ═══════════ history ════════════════════════════════════════════════
+     `.usage` is a snapshot; `.usage.log` beside it is the same reading over
+     time, which is what makes a burn rate and a projection possible. It costs
+     nothing — the status line is handed this session's limits free on every
+     render and appends them.
+
+     Everything here degrades to nothing. A fresh install has no history, and
+     the honest thing to draw then is not a flat line or a zero — it is empty
+     space. Every function below returns "" rather than a half-answer.
+     ═══════════════════════════════════════════════════════════════════════ */
+  let HIST = {};        /* name → {rate5, eta5, rate7, eta7, samples:[[ts,u5,u7]…]} */
+  let NEXT = null;      /* the ranked answer, straight from `claudius next --json` */
+  const histOf = name => HIST[name] || null;
+  const nextPick = () => (NEXT && NEXT.pick) || "";
+
+  /* Time to the ceiling, in the unit that carries it: a countdown while that is
+     still a number you can act on, a clock time once it isn't, a date beyond
+     today — a bare "17:56" four days out says the wrong thing entirely. */
+  function etaText(ep){
+    const secs = ep - Math.floor(Date.now()/1000);
+    if (secs <= 0) return "any moment";
+    if (secs < 5400) return "in " + Math.max(1, Math.round(secs/60)) + "m";
+    const d = new Date(ep*1000);
+    const t = d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
+    return d.toDateString() === new Date().toDateString() ? "at " + t
+      : d.toLocaleDateString([], { month:"short", day:"numeric" }) + " " + t;
+  }
+  /* Severity is distance to the limit; here that distance is measured in time
+     instead of percent. Same axis, so it may wear the same colours. */
+  function etaSev(ep){
+    const s = ep - Math.floor(Date.now()/1000);
+    return s < 3600 ? "crit" : s < 3*3600 ? "warn" : "";
+  }
+
+  /* Fixed 0–100, never auto-ranged: a sparkline that rescales to its own data
+     draws a flat 3% week and a flat 90% week identically, which is the opposite
+     of the reading. Coordinates are in real pixels so the stroke and the end dot
+     stay round — a 0–100 viewBox squashed into a 78×15 box would flatten both. */
+  const SPARK_W = 56, SPARK_H = 18;
+  function sparkSVG(samples, col){
+    if (!samples) return "";
+    const pts = samples.filter(s => s[col] != null);
+    if (pts.length < 3) return "";
+    const t0 = pts[0][0], span = (pts[pts.length-1][0] - t0) || 1;
+    const xy = pts.map(s => [
+      (s[0] - t0) / span * (SPARK_W - 3) + 1.5,
+      SPARK_H - 1 - Math.min(100, Math.max(0, s[col])) / 100 * (SPARK_H - 2)
+    ]);
+    const d = xy.map(([x,y]) => x.toFixed(1) + "," + y.toFixed(1)).join(" ");
+    const [lx, ly] = xy[xy.length - 1];
+    return `<svg class="spark" viewBox="0 0 ${SPARK_W} ${SPARK_H}" aria-hidden="true"
+      ><polyline points="${d}"></polyline><circle cx="${lx.toFixed(1)}"
+      cy="${ly.toFixed(1)}" r="1.7"></circle></svg>`;
+  }
+
+  /* One function for both windows — they read identically, only the column and
+     the field names differ. `k` is 5 or 7. */
+  function trendHTML(name, k){
+    const h = histOf(name);
+    if (!h) return "";
+    const rate = k === 5 ? h.rate5 : h.rate7;
+    const eta  = k === 5 ? h.eta5  : h.eta7;
+    const spark = sparkSVG(h.samples, k === 5 ? 1 : 2);
+    if (rate == null && !spark) return "";
+    const bits = [];
+    bits.push(rate == null
+      ? `<span>no rate yet</span>`
+      : `<span class="rate">${rate > 0 ? "+" : ""}${rate.toFixed(1)}%/h</span>`);
+    if (spark) bits.push(spark);
+    if (eta)
+      bits.push(`<span class="hit s-${etaSev(eta)}" data-eta="${eta}"
+        ><span class="ms">flag</span>100% ${etaText(eta)}</span>`);
+    else if (rate != null)
+      bits.push(`<span class="hit">${rate <= 0.5 ? "holding" : "clears first"}</span>`);
+    return `<div class="trend">${bits.join("")}</div>`;
+  }
+
+  /* Redrawn on the same ticker as the reset countdowns, and for the same reason:
+     "in 40m" is wrong a minute later. */
+  function paintTrends(){
+    $$("[data-eta]").forEach(el => {
+      const ep = +el.dataset.eta;
+      el.className = "hit s-" + etaSev(ep);
+      el.innerHTML = `<span class="ms">flag</span>100% ${etaText(ep)}`;
+    });
+  }
+
+  /* The recommendation, as a chip. It is an action, so it takes the action
+     colour; on the hero it reports that you are already there instead. */
+  function nextChip(name){
+    if (!NEXT || nextPick() !== name) return "";
+    const why = esc(NEXT.reason || "");
+    if (name === activeName())
+      return `<span class="nextchip" title="${why}"><span class="ms">check</span
+        >you're on it</span>`;
+    return `<span class="nextchip" title="${why}"><span class="ms">arrow_forward</span
+      >use next</span>`;
+  }
+
   /* ═══════════ log ════════════════════════════════════════════════════ */
   const LOG = [];
   const LOG_ICON = { live:"bolt", cache:"cached", switch:"swap_horiz", copy:"content_copy",
@@ -1003,7 +1076,7 @@
   const eventLayers = `<span class="grainstatic"></span><span class="sweep"></span>
     <span class="ripple"></span><span class="ripple2"></span><span class="cursorlight"></span>`;
 
-  function windowBlock(n, u, v, ep, win){
+  function windowBlock(n, u, v, ep, win, name){
     if (v == null)
       return `<div class="nodata"><span class="ms">bolt</span>
         ${n}${u} — no limits cached yet</div>`;
@@ -1029,7 +1102,8 @@
           <span class="lt"><i class="f-${s}" data-w="${Math.min(100, v)}"></i></span></div>
         <div class="lane"><span class="lk">window</span>
           <span class="lt"><i class="f-clock" data-w="${el == null ? 0 : el}"></i></span></div>
-      </div>`;
+      </div>
+      ${trendHTML(name, n)}`;
   }
 
   /* The active account is the one you never have to name — `claude` alone runs
@@ -1069,7 +1143,7 @@
         <div class="hhd">
           <div style="min-width:0">
             <div class="hkick"><span class="bead"></span>global account${
-              p.sub ? " · " + esc(p.sub) : ""}</div>
+              p.sub ? " · " + esc(p.sub) : ""}${nextChip(p.name)}</div>
             <div class="hname">${esc(p.name)}</div>
             <div class="hmail">${ident}</div>
           </div>
@@ -1078,8 +1152,8 @@
           </div>
         </div>
         <div class="windows">
-          <div>${windowBlock(5, "h", p.u5, p.r5, W5)}</div>
-          <div class="wsplit">${windowBlock(7, "d", p.u7, p.r7, W7)}</div>
+          <div>${windowBlock(5, "h", p.u5, p.r5, W5, p.name)}</div>
+          <div class="wsplit">${windowBlock(7, "d", p.u7, p.r7, W7, p.name)}</div>
         </div>
         <div class="hfoot">
           <span class="cache">cache ${ago(p.uts)}</span>
@@ -1103,9 +1177,9 @@
             <div class="nm">${esc(p.name)}</div>
             <div class="em">${p.email ? esc(p.email) : "no identity saved"}</div>
           </div>
-          ${blocked ? `<span class="sub">blocked</span>` : ""}
+          ${blocked ? `<span class="sub">blocked</span>` : nextChip(p.name)}
         </div>
-        ${windowBlock(5, "h", p.u5, p.r5, W5)}
+        ${windowBlock(5, "h", p.u5, p.r5, W5, p.name)}
         <div class="q2"><span class="wmini">7d</span>
           ${b7 == null
             ? `<span style="color:var(--fg-3)">no data</span>`
@@ -1292,6 +1366,7 @@
       el.textContent = resetText(ep || 0);
     });
     $$(".peers .cell.follow .k").forEach(el => { el.textContent = resetLabel(); });
+    paintTrends();
   }
   /* paintSessions is in here because switching the active account changes the
      shape of every copied command — the active one takes bare `claude`. */
@@ -1340,9 +1415,35 @@
     if (cut) saveStyle();
   }
 
+  /* History and the recommendation are read alongside the profiles but never
+     block them: both are free, local and additive, and a page that showed
+     nothing because a sparkline failed would be a worse page than one with no
+     sparkline. A failure here leaves the previous reading in place and says so
+     once, rather than logging a row every time the 30-second ring comes round. */
+  let histWarned = false;
+  async function loadHistory(quiet){
+    try{
+      const [h, n] = await Promise.all([
+        fetch("/api/history?points=48", { cache:"no-store" }).then(r => r.json()),
+        fetch("/api/next", { cache:"no-store" }).then(r => r.json())
+      ]);
+      const map = {};
+      (Array.isArray(h) ? h : []).forEach(row => { map[row.name] = row; });
+      HIST = map;
+      NEXT = (n && typeof n === "object") ? n : null;
+      histWarned = false;
+    }catch(e){
+      if (!histWarned && !quiet){
+        histWarned = true;
+        log("err", `could not read usage history — ${esc(e.message)}`);
+      }
+    }
+  }
+
   async function load(quiet){
     try{
       PROFILES = await getProfiles();
+      await loadHistory(quiet);
       pruneStyle();
       renderAll();
       paintResets();
@@ -1371,6 +1472,8 @@
       const p = PROFILES.find(x => x.name === name) || {};
       log("live", `<b>${esc(name)}</b> read live — 5h ${p.u5 ?? "—"}% · 7d ${p.u7 ?? "—"}%`);
       busy.delete(name);
+      /* the read just appended a sample, so the rate it feeds has moved too */
+      await loadHistory(true);
       renderAll(); paintResets();
     }catch(e){
       busy.delete(name);

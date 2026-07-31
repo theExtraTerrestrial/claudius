@@ -500,6 +500,30 @@ if !cache_path.empty? && (cache.key?("5h") || cache.key?("7d"))
     File.chmod(0o600, cache_path)
   rescue
   end
+  # …and append the same reading to the history log, which is what turns a
+  # snapshot into a burn rate. Timestamp first here: a log is read in time order
+  # and sorted on its first field. Appenders are deliberately dumb — one line,
+  # never a rewrite — so the file's shape is decided in exactly one place
+  # (usage_history_json prunes it). See SAMPLE_MIN for the sampling interval.
+  begin
+    log_path = cache_path + ".log"
+    last = 0
+    if File.exist?(log_path)
+      tail = File.open(log_path, 'rb') do |f|
+        f.seek(-[f.size, 256].min, IO::SEEK_END)
+        f.read
+      end
+      last = tail.to_s.split("\n").last.to_s.split.first.to_i
+    end
+    if now.to_i - last >= 120
+      File.open(log_path, 'a') do |f|
+        f.write("#{now.to_i} #{cache.fetch('5h', '-')} #{cache.fetch('7d', '-')} " \
+                "#{resets.fetch('5h', '-')} #{resets.fetch('7d', '-')}\n")
+      end
+      File.chmod(0o600, log_path)
+    end
+  rescue
+  end
 end
 
 puts parts.join(" · ")
@@ -2145,6 +2169,245 @@ puts JSON.generate(out)
 RB
 }
 
+# ── Usage history ─────────────────────────────────────────────────────────────
+# `.usage` is one line, overwritten — a snapshot. `.usage.log` beside it is the
+# same reading appended over time, which is what makes a burn rate and a
+# projection possible. It costs no API calls: the status line is handed this
+# session's live limits for free on every render, and both it and fetch_usage
+# append there (see the appenders — they only ever add one line).
+#
+# So the shape of the file is decided HERE, in one place: everything from the
+# last 6h at full resolution (the 5h window reads off that), one sample per 15
+# minutes before it, nothing past 8 days. Pruning rewrites only when the file
+# has grown past PRUNE_AT lines, so the common read does no writing at all.
+#
+# Emits, per profile:
+#   {name, n, first, last, rate5, eta5, rate7, eta7, samples:[[ts,u5,u7],…]}
+# rate is % per hour over the CURRENT window and null when there is too little
+# history to say. eta is the epoch utilization reaches 100% at that rate, and is
+# null both when the rate is unknown and when the ceiling lands after the window
+# resets — i.e. null means "nothing to warn about", not "no data".
+# points 0 omits the samples array entirely (a summary-only read).
+usage_history_json() {
+  local points="${1:-48}" only="${2:-}"
+  ruby - "$PROFILE_ROOT" "$points" "$only" <<'RB'
+require 'json'
+
+root, points, only = ARGV[0], ARGV[1].to_i, ARGV[2].to_s
+FINE     = 6 * 3600      # keep every sample this recent
+COARSE   = 900           # older than FINE: at most one sample per 15 minutes
+KEEP     = 8 * 86_400    # 7d window plus a day of margin; older is dropped
+PRUNE_AT = 1500          # lines before a rewrite earns its cost
+now = Time.now.to_i
+
+# A sample is "ts u5 u7 r5 r7" with "-" for a missing field, same placeholder
+# discipline as .usage. Anything unparseable is skipped rather than fatal — a
+# torn line from a killed append must not take the whole history with it.
+def parse(path)
+  rows = []
+  File.foreach(path) do |line|
+    f = line.split
+    next if f.length < 3
+    ts = f[0].to_i
+    next if ts <= 0
+    num = lambda { |x| (x.nil? || x == '-') ? nil : x.to_i }
+    rows << [ts, num.call(f[1]), num.call(f[2]), num.call(f[3]), num.call(f[4])]
+  end
+  rows.sort_by! { |r| r[0] }
+  rows
+rescue StandardError
+  []
+end
+
+def thin(rows, now)
+  seen = {}
+  rows.select do |r|
+    if now - r[0] > KEEP           then false
+    elsif now - r[0] <= FINE       then true
+    else
+      b = r[0] / COARSE
+      seen[b] ? false : (seen[b] = true)
+    end
+  end
+end
+
+# % per hour. Samples are segmented by their reset epoch, which sits still inside
+# a window and jumps when the window rolls — so it identifies the current window
+# exactly, with no need to guess from a drop in utilization. Measured over the
+# most recent `pref` seconds when that spans enough to mean anything, otherwise
+# over the whole window; nil when even that is too short to divide by.
+def rate_of(rows, ui, ri, reset, pref, min_span)
+  cur = rows.select { |r| r[ui] }
+  cur = cur.select { |r| r[ri] == reset } if reset
+  return nil if cur.length < 2
+  last = cur.last
+  win = cur.select { |r| last[0] - r[0] <= pref }
+  win = cur if win.length < 2 || last[0] - win.first[0] < min_span
+  dt = last[0] - win.first[0]
+  return nil if win.length < 2 || dt < min_span
+  ((last[ui] - win.first[ui]) * 3600.0 / dt).round(2)
+end
+
+# Where that rate meets 100%, projected from the last sample. A rate at or below
+# a trickle is not a trend worth extrapolating, and a ceiling that lands after
+# the window clears is not a ceiling you will hit.
+def eta_of(rows, ui, rate, reset)
+  return nil unless rate && rate > 0.5
+  last = rows.select { |r| r[ui] }.last
+  return nil unless last
+  secs = ((100 - last[ui]) / rate * 3600).round
+  return nil if secs <= 0
+  t = last[0] + secs
+  (reset && t >= reset) ? nil : t
+end
+
+# Evenly spaced by index, first and last always kept — enough for a sparkline
+# without shipping a week of samples to draw forty pixels.
+def pick(rows, n)
+  return rows if rows.length <= n
+  (0...n).map { |i| rows[(i * (rows.length - 1).to_f / (n - 1)).round] }.uniq
+end
+
+names = Dir.exist?(root) ? Dir.children(root).sort : []
+names = names.select { |n| n == only } unless only.empty?
+out = []
+names.each do |name|
+  next if name.start_with?('.')
+  dir = File.join(root, name)
+  next unless File.directory?(dir)
+  path = File.join(dir, '.usage.log')
+
+  rows = File.exist?(path) ? parse(path) : []
+  if rows.length > PRUNE_AT
+    kept = thin(rows, now)
+    if kept.length < rows.length
+      begin
+        tmp = path + '.tmp'
+        File.open(tmp, 'w') do |f|
+          kept.each do |r|
+            f.write("#{r[0]} #{r[1] || '-'} #{r[2] || '-'} #{r[3] || '-'} #{r[4] || '-'}\n")
+          end
+        end
+        File.chmod(0o600, tmp)
+        File.rename(tmp, path)
+        rows = kept
+      rescue StandardError
+        rows = kept   # the read still uses the thinned view even if the write failed
+      end
+    end
+  end
+
+  # The reset epochs come from the samples themselves, not from .usage, so the
+  # rate and the window it is measured over can never be out of step.
+  r5 = rows.reverse.find { |r| r[3] }&.at(3)
+  r7 = rows.reverse.find { |r| r[4] }&.at(4)
+  rate5 = rate_of(rows, 1, 3, r5, 45 * 60, 10 * 60)
+  rate7 = rate_of(rows, 2, 4, r7, 12 * 3600, 30 * 60)
+
+  row = {
+    'name' => name, 'n' => rows.length,
+    'first' => rows.empty? ? nil : rows.first[0],
+    'last'  => rows.empty? ? nil : rows.last[0],
+    'rate5' => rate5, 'eta5' => eta_of(rows, 1, rate5, r5),
+    'rate7' => rate7, 'eta7' => eta_of(rows, 2, rate7, r7)
+  }
+  row['samples'] = pick(rows, points).map { |r| [r[0], r[1], r[2]] } if points > 0
+  out << row
+end
+puts JSON.generate(out)
+RB
+}
+
+# ── Which account next ────────────────────────────────────────────────────────
+# Ranks the profiles by how much room they have left and prints one name. The
+# rules, in order, and why each is there rather than something cleverer:
+#
+#   1. A window at 100% is a wall, so a profile behind one is not a candidate.
+#   2. Headroom is the SMALLER of the two windows' remaining room. 4% left on the
+#      7d is 4% left, however empty the 5h looks.
+#   3. Headroom is bucketed to 5 points before it is compared. Two accounts
+#      within a few points of each other are not meaningfully different, and
+#      pretending otherwise would let noise outvote the tie-breaks below.
+#   4. A fresh reading beats a stale one. An hour-old number is a guess.
+#   5. Then the idler account, by burn rate — the other one probably has a
+#      session running in it right now.
+#   6. Then the account already active, because not switching is free.
+#
+# An imminent reset is deliberately NOT credited as headroom: it would hand
+# `claudius run "$(claudius next)"` an account that is still walled off for the
+# next few minutes. When nothing is usable the answer is the wait, not a name.
+next_json() {
+  ruby - "$1" "$2" <<'RB'
+require 'json'
+profiles = (JSON.parse(ARGV[0].to_s) rescue [])
+hist     = (JSON.parse(ARGV[1].to_s) rescue [])
+rate = {}
+hist.each { |h| rate[h['name']] = h }
+now = Time.now.to_i
+STALE = 3600
+# A 7d reset is days away, where a bare clock time reads as today. Same rule as
+# `history`: anything but today carries its date.
+when_at = lambda do |ep|
+  t = Time.at(ep)
+  t.strftime(t.strftime('%F') == Time.now.strftime('%F') ? '%H:%M' : '%b %-d %H:%M')
+end
+
+rows = profiles.map do |p|
+  u5, u7 = p['u5'], p['u7']
+  h5 = u5.nil? ? nil : 100 - u5
+  h7 = u7.nil? ? nil : 100 - u7
+  head = [h5, h7].compact.min
+  bind = (head && h5 == head) ? '5h' : '7d'
+  walls = []
+  walls << ['5h', p['r5']] if u5 && u5 >= 100
+  walls << ['7d', p['r7']] if u7 && u7 >= 100
+  stale = p['uts'].nil? || (now - p['uts']) > STALE
+  h = rate[p['name']] || {}
+
+  # Both windows have to clear, so the wait is the later of them.
+  clear_at = walls.map { |_, ep| ep }.compact.max
+  why =
+    if !walls.empty?
+      "at the #{walls.map(&:first).join(' + ')} limit" +
+        (clear_at ? " · clears #{when_at.call(clear_at)}" : '')
+    elsif head.nil?
+      'no usage cached — needs a refresh'
+    else
+      s = "#{head}% left on the #{bind}"
+      s += " · hits it ~#{when_at.call(h['eta5'])}" if bind == '5h' && h['eta5']
+      s += ' · stale reading' if stale
+      s
+    end
+
+  { 'name' => p['name'], 'active' => p['active'], 'u5' => u5, 'u7' => u7,
+    'uts' => p['uts'], 'rate5' => h['rate5'], 'eta5' => h['eta5'],
+    'headroom' => head, 'binding' => head.nil? ? nil : bind,
+    'eligible' => walls.empty? && !head.nil?, 'stale' => stale,
+    'clear_at' => clear_at, 'why' => why }
+end
+
+rows = rows.sort_by do |r|
+  [r['eligible'] ? 0 : 1,
+   r['headroom'].nil? ? 1 : 0,
+   r['headroom'].nil? ? 0 : -(r['headroom'] / 5),
+   r['stale'] ? 1 : 0,
+   r['rate5'] || 0,
+   r['active'] ? 0 : 1,
+   r['name']]
+end
+
+first = rows.find { |r| r['eligible'] }
+soonest = rows.select { |r| r['clear_at'] }.min_by { |r| r['clear_at'] }
+puts JSON.generate(
+  'pick' => first && first['name'],
+  'reason' => first && first['why'],
+  'blocked_until' => first ? nil : (soonest && soonest['clear_at']),
+  'first_to_clear' => first ? nil : (soonest && soonest['name']),
+  'ranked' => rows
+)
+RB
+}
+
 # ── Sessions ──────────────────────────────────────────────────────────────────
 # The conversation pool. Because `run` symlinks ~/.claude/projects into every
 # wired profile, sessions are NOT per-account: one pool, and any profile can
@@ -2409,6 +2672,155 @@ cmd_list() {
     printf '%s%s%-14s%s  %s%s%s   %s\n' \
       "$mark" "$C_BOLD" "$n" "$C_RESET" "$C_DIM" "${e:-(no identity)}${o:+ $GLYPH_DOT $o}" "$C_RESET" "$usage"
   done < <(list_profiles)
+}
+
+cmd_history() {
+  local json=false points=48 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)   json=true; shift ;;
+      --points) points="${2:-48}"; shift 2 || shift ;;
+      -*) echo "usage: $(basename "$0") history [profile] [--json] [--points N]" >&2; return 2 ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  case "$points" in ''|*[!0-9]*) points=48 ;; esac
+  [[ "$points" -gt 500 ]] && points=500
+  # points 0 means "omit the samples array" — a summary-only shape that only makes
+  # sense for --json. The printed report is largely its sparkline.
+  [[ "$json" == true || "$points" -gt 0 ]] || points=48
+  if [[ -n "$name" && ! -d "$PROFILE_ROOT/$name" ]]; then
+    echo "Profile '$name' does not exist." >&2
+    return 1
+  fi
+
+  if [[ "$json" == true ]]; then
+    usage_history_json "$points" "$name"
+    return 0
+  fi
+
+  local rows
+  rows="$(usage_history_json "$points" "$name")"
+  ruby - "$rows" <<'RB'
+require 'json'
+rows = (JSON.parse(ARGV[0].to_s) rescue [])
+if rows.empty?
+  puts 'No profiles found.'
+  exit 0
+end
+BARS = %w[▁ ▂ ▃ ▄ ▅ ▆ ▇ █]
+now = Time.now.to_i
+
+# Fixed 0–100 scale, never auto-ranged: a sparkline that rescales itself makes a
+# flat 3% week look identical to a flat 90% one, which is the opposite of the
+# reading. Terminals get 24 columns of it at most.
+spark = lambda do |vals|
+  vals = vals.compact
+  return '' if vals.length < 3
+  vals = (0...24).map { |i| vals[(i * (vals.length - 1).to_f / 23).round] } if vals.length > 24
+  vals.map { |v| BARS[[[v, 0].max, 100].min * (BARS.length - 1) / 100] }.join
+end
+span = lambda do |s|
+  return "#{s / 86_400}d" if s >= 86_400
+  return "#{s / 3600}h"   if s >= 3600
+  "#{s / 60}m"
+end
+# A 7d projection can land days out, where a bare "17:56" says the wrong thing
+# entirely — so anything other than today carries its date.
+when_at = lambda do |ep|
+  t = Time.at(ep)
+  t.strftime(t.strftime('%F') == Time.now.strftime('%F') ? '%H:%M' : '%b %-d %H:%M')
+end
+
+rows.each do |r|
+  puts r['name']
+  samples = r['samples'] || []
+  if samples.length < 2
+    puts '    no history yet — it fills as the status line renders, at no API cost'
+    puts
+    next
+  end
+  [['5h', 1, 'rate5', 'eta5'], ['7d', 2, 'rate7', 'eta7']].each do |label, i, rk, ek|
+    vals = samples.map { |s| s[i] }
+    cur = vals.compact.last
+    next unless cur
+    rate = r[rk]
+    trend = rate.nil? ? 'too little history' : format('%+.1f%%/h', rate)
+    where = if r[ek]           then "→ 100% around #{when_at.call(r[ek])}"
+            elsif rate.nil?    then ''
+            elsif rate <= 0.5  then '→ holding steady'
+            else                    '→ the window clears first'
+            end
+    puts format('    %-3s %3d%%  %-24s  %-11s %s', label, cur, spark.call(vals), trend, where)
+  end
+  puts format('    %d samples over %s', r['n'], span.call(now - r['first']))
+  puts
+end
+RB
+}
+
+# The question the whole tool exists to answer, as one word on stdout, so it can
+# be used directly:  claudius run "$(claudius next)"
+cmd_next() {
+  local json=false explain=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)    json=true; shift ;;
+      --explain) explain=true; shift ;;
+      *) echo "usage: $(basename "$0") next [--json] [--explain]" >&2; return 2 ;;
+    esac
+  done
+  local profiles hist
+  profiles="$(list_profiles_json)"
+  hist="$(usage_history_json 0)"
+  local out
+  out="$(next_json "$profiles" "$hist")" || return 1
+  if [[ "$json" == true ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  ruby - "$out" "$explain" <<'RB'
+require 'json'
+d = (JSON.parse(ARGV[0].to_s) rescue {})
+explain = ARGV[1] == 'true'
+pick = d['pick']
+
+unless explain
+  if pick
+    puts pick
+    exit 0
+  end
+  # Nothing is usable. That is an answer, but not a name — say when it changes on
+  # stderr so a `$(claudius next)` substitution stays empty rather than absorbing
+  # the explanation.
+  if d['blocked_until']
+    # A 7d wall clears days out, where a bare clock time reads as tonight.
+    t = Time.at(d['blocked_until'])
+    same_day = t.strftime('%F') == Time.now.strftime('%F')
+    warn "Every account is at a limit. The first to clear is #{d['first_to_clear']} " \
+         "at #{t.strftime(same_day ? '%H:%M' : '%b %-d %H:%M')}."
+  else
+    warn 'No usable account: no usage has been read yet. Try `claudius refresh <profile>`.'
+  end
+  exit 1
+end
+
+rows = d['ranked'] || []
+if rows.empty?
+  puts 'No profiles found.'
+  exit 0
+end
+puts format('  %-14s %5s %5s %9s  %s', '', '5h', '7d', 'burn', 'why')
+rows.each do |r|
+  mark = r['name'] == pick ? '→ ' : '  '
+  pct = lambda { |v| v.nil? ? '  –' : format('%3d%%', v) }
+  burn = r['rate5'].nil? ? '       –' : format('%+7.1f/h', r['rate5'])
+  puts format('%s%-14s %5s %5s %9s  %s',
+              mark, r['name'], pct.call(r['u5']), pct.call(r['u7']), burn, r['why'])
+end
+puts
+puts(pick ? "→ #{pick}" : 'nothing usable right now')
+RB
 }
 
 cmd_status() {
@@ -2783,6 +3195,9 @@ ${C_MUTED}USAGE${C_RESET}
   $prog                      launch the interactive TUI (default)
   $prog list [--json]        list profiles + cached usage (+ active flag)
   $prog status [--json]      show the active profile's live identity + usage
+  $prog next [--explain]     print the account with the most room left
+  $prog history [profile] [--json] [--points N]
+                             usage over time: burn rate + when you hit a limit
   $prog sessions [--json] [--limit N]
                              list the shared session pool, newest first
   $prog refresh <profile>    renew token if needed & rewrite the usage cache
@@ -2813,6 +3228,10 @@ ${C_MUTED}RUN vs ACTIVATE${C_RESET}
 
 ${C_MUTED}NOTES${C_RESET}
   • --json output is the stable contract consumed by the dashboard.
+  • 'next' prints one name, so it composes:  $prog run "\$($prog next)"
+    It exits 1 and says when the wait ends if every account is at a limit.
+  • 'history' costs nothing: the status line records each reading it is
+    handed, so the burn rate builds up for free while you work.
   • 'add' needs an interactive terminal (browser sign-in); it is CLI-only.
   • 'statusline' also warms the usage cache for free. Prefer your own status line?
     Keep just the cache bonus: node ~/.claudius/statusline-usage-cache.js | <yours>
@@ -2834,6 +3253,8 @@ main() {
     ""|menu)   show_menu; disable_raw_mode; leave_alt_screen ;;
     list)      cmd_list "$@" ;;
     sessions)  cmd_sessions "$@" ;;
+    next)      cmd_next "$@" ;;
+    history)   cmd_history "$@" ;;
     status)    cmd_status "$@" ;;
     refresh)   cmd_refresh "$@" ;;
     activate)  cmd_activate "$@" ;;

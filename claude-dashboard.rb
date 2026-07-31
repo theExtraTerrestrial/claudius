@@ -75,6 +75,26 @@ rescue StandardError
   []
 end
 
+# Read-only usage history and the ranked "which account next" answer. Both are
+# the CLI's own contracts (`history --json`, `next --json`) for the third time
+# and the same reason: the ranking rules in particular must have exactly one
+# home, or the page and the terminal will start recommending different accounts.
+def read_history(points = 48)
+  out, _status = Open3.capture2e(SCRIPT, 'history', '--json', '--points', points.to_s)
+  parsed = JSON.parse(out)
+  parsed.is_a?(Array) ? parsed : []
+rescue StandardError
+  []
+end
+
+def read_next
+  out, _status = Open3.capture2e(SCRIPT, 'next', '--json')
+  parsed = JSON.parse(out)
+  parsed.is_a?(Hash) ? parsed : {}
+rescue StandardError
+  {}
+end
+
 # Shell a mutation back into the bash CLI. Returns [ok, combined_output] with any
 # ANSI colour escapes stripped so the output is clean when surfaced in the UI.
 def run_cli(*args)
@@ -152,6 +172,16 @@ server.mount_proc('/api/sessions') do |req, res|
           else 40
           end
   json_response(res, read_sessions(limit))
+end
+
+server.mount_proc('/api/history') do |req, res|
+  raw = query_param(req, 'points')
+  points = raw.to_i > 0 ? [raw.to_i, 500].min : 48
+  json_response(res, read_history(points))
+end
+
+server.mount_proc('/api/next') do |_req, res|
+  json_response(res, read_next)
 end
 
 server.mount_proc('/api/refresh') do |req, res|

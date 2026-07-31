@@ -49,6 +49,24 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   Never decode a path from `dirkey`; that encoding is lossy.
 - `.usage` → `u5 u7 uts r5 r7`, space-separated. Write `-` for a missing window;
   never omit a field.
+- `.usage.log` → one sample per line, `ts u5 u7 r5 r7`, timestamp FIRST (a log is
+  read in time order), same `-` discipline. Appenders only ever append one line,
+  throttled to 120s, and never rewrite the file — `usage_history_json` is the
+  single place its shape is decided, so pruning rules live there and nowhere else.
+  Tolerate a torn or junk line: a killed append must not cost the history.
+- `claudius history --json` →
+  `[{name, n, first, last, rate5, eta5, rate7, eta7, samples:[[ts,u5,u7]…]}]`.
+  `rate` is % per hour over the **current** window (segmented by reset epoch, not
+  guessed from a drop in utilization) and null when there is too little history to
+  divide by. `eta` is null both when the rate is unknown and when the ceiling
+  lands after the window resets — null means "nothing to warn about". `--points 0`
+  omits `samples` and is a summary-only shape.
+- `claudius next --json` → `{pick, reason, blocked_until, first_to_clear, ranked}`.
+  `pick` is null when nothing is usable; bare `next` then exits 1 and explains on
+  **stderr**, so `$(claudius next)` stays empty instead of feeding `run` a
+  sentence. The ranking rules are documented above `next_json` — change them
+  there, never in the page, or the terminal and the dashboard will start
+  recommending different accounts.
 - `dashboard.html` → the sidecar substitutes `{{TOKEN}}` and `{{ROOT}}` only.
   Keep the file valid standalone HTML.
 - Handle usage values above 100 and the case of no active profile. Both are real.
@@ -103,20 +121,25 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 - Two accounts running concurrently on macOS is observed working on claude
   2.1.220. Still unobserved, so describe as reasoned: the fallback for a CLI too
   old to namespace the Keychain item, and the refusal paths.
-- Run `bash tests/dashboard.sh` (90 assertions, ~1s) after any change to
+- Run `bash tests/dashboard.sh` (117 assertions, ~1s) after any change to
   `dashboard.html`. It slices the page's `<script>` blocks by their `═══ banner ═══`
   section comments and runs the pure logic under node against stubbed storage and
   DOM. Renaming a banner breaks extraction loudly and on purpose — fix the test's
   `want` list rather than letting it test nothing. node is not a claudius
   dependency: the suite skips when it is absent.
-- Run `bash tests/dashboard-live.sh` (24 assertions, ~25s) for anything touching the
+- Run `bash tests/dashboard-live.sh` (28 assertions, ~25s) for anything touching the
   session panel, the filters or the keyboard. It starts its own sidecar and a
   headless Chromium and drives the real page over the DevTools protocol — the layer
   that caught a `cd` into the wrong directory and an encoded path leaking on screen.
   Read-only: it never clicks anything that mutates. It skips when node or Chromium
   is missing, when its port is taken (probably the user's dashboard), and
   per-assertion when the pool lacks the shape being checked.
-- Verify TUI changes by hand — there is no suite for the TUI.
+- Run `bash tests/history.sh` (40 assertions, ~15s) after any change to the
+  `.usage.log` format, `usage_history_json` or `next_json`. Throwaway `HOME`,
+  every sample written by the test, no API call — the rate segmentation and the
+  pruning rules are the parts that would otherwise fail silently and slowly.
+- Verify TUI changes by hand — there is no suite for the TUI. It shows no
+  burn rate and no recommendation; that is a gap, not a decision.
 - Do not claim macOS behaviour works. It cannot be tested here; say so.
 
 ## Commits

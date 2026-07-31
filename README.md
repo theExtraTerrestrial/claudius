@@ -42,6 +42,9 @@ bash ~/.claudius/install.sh --uninstall
 claudius                      launch the interactive TUI (default)
 claudius list [--json]        list profiles + cached usage (+ active flag)
 claudius status [--json]      show the active profile's live identity + usage
+claudius next [--explain]     print the account with the most room left
+claudius history [profile] [--json] [--points N]
+                              usage over time: burn rate + when you hit a limit
 claudius refresh <profile>    renew token if needed & rewrite the usage cache
 claudius activate <profile>   switch the global ~/.claude to <profile>
 claudius run [profile] [args] open a claude session in <profile> WITHOUT
@@ -55,6 +58,52 @@ claudius help | -h            show this help
 ```
 
 `--json` output is the stable contract the dashboard consumes.
+
+## Which account now?
+
+That is the question having several accounts creates, and `next` answers it in
+one word, so it composes:
+
+```bash
+claudius run "$(claudius next)"      # open a session on whichever has most room
+claudius next --explain              # the ranking, and why each account placed
+```
+
+Headroom is the **smaller** of the two windows: 4% left on the 7d is 4% left,
+however empty the 5h looks. Accounts within five points of each other are
+treated as equal — that difference is noise — and the tie goes to the fresher
+reading, then the idler account, then the one already active, because not
+switching is free. An account behind a window at 100% is not a candidate at
+all; an imminent reset is deliberately not credited as headroom, since that
+would hand `run` an account still walled off for the next few minutes. When
+nothing is usable the answer is the wait, not a name: `next` exits 1 and says
+on stderr which account clears first and when.
+
+## Usage over time
+
+`.usage` is one line, overwritten — a snapshot. `.usage.log` beside it is the
+same reading appended over time, which is what makes a **burn rate** and a
+projection possible:
+
+```
+erhards2
+    5h   67%  ▄▄▄▄▅▅▅▅▅                 +51.5%/h    → 100% around 01:20
+    7d   21%  ▂▂▂▂▂▂▂▂▂                 too little history
+```
+
+It costs **no API calls**. The status line is handed this session's live limits
+free on every render, so history accumulates while you work; a sample lands at
+most every two minutes. The file is bounded without the appenders knowing how:
+they only ever add a line, and the reader keeps the last six hours at full
+resolution, thins anything older to one sample per quarter hour, and drops
+everything past eight days.
+
+A rate is measured over the **current** window only, identified by its reset
+epoch — that value sits still inside a window and jumps when the window rolls,
+so it separates them exactly, where guessing from a drop in utilization would
+not. Nothing is claimed without enough history to divide by, and a ceiling that
+lands after the window resets is not reported, because it is not a ceiling you
+will hit.
 
 ## Several accounts at once (`run`)
 
@@ -171,6 +220,15 @@ the hero slot as the switch lands.
   may renew a token); the price rides on the control that spends it, and the
   footer keeps a running tally. **Watch cache** only re-reads the local cache on a
   30-second ring — that part is free and never calls the API.
+- **The burn rate is named, not just implied.** Under each window, the rate per
+  hour and — when the ceiling arrives before the window clears — roughly when,
+  reddening as it nears. A sparkline beside it carries the shape, on a fixed
+  0–100 scale so a flat 3% week and a flat 90% week never draw the same line.
+  With too little history to divide by, none of it is drawn: empty space beats a
+  half-answer.
+- **One card is chipped `use next`** — the account `claudius next` would pick,
+  ranked by the same rules in the same place, so the page and the terminal can
+  never disagree. When it is the account you are already on, it says so instead.
 - **The palette** (the `GLOBAL ·` chip) is one place to switch accounts, read all
   limits, and set preferences: reset display (**countdown** / **clock** /
   **total**), colour bias, and contrast intensity. All three are remembered in
@@ -223,7 +281,9 @@ cache, and re-emits the JSON unchanged, so you see no difference:
 
 Both are best-effort and swallow all errors — cache writing can never slow or break
 your status line. Node ships with Claude Code, so there's nothing to install. Cache
-format is `u5 u7 uts r5 r7` in `~/.claude-profiles/<name>/.usage`.
+format is `u5 u7 uts r5 r7` in `~/.claude-profiles/<name>/.usage`, and each reading
+is also appended to `.usage.log` as `ts u5 u7 r5 r7` (at most one sample every two
+minutes) — that log is what `claudius history` and the dashboard's burn rate read.
 
 ## Files
 
@@ -236,3 +296,4 @@ format is `u5 u7 uts r5 r7` in `~/.claude-profiles/<name>/.usage`.
 - `tests/share.sh` — sandbox tests for the shared-session wiring (throwaway `HOME`)
 - `tests/dashboard.sh` — the page's own logic, run under node against stubs
 - `tests/dashboard-live.sh` — the page driven in a headless browser, read-only
+- `tests/history.sh` — the burn-rate arithmetic and the ranking (throwaway `HOME`)

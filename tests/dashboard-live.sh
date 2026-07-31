@@ -220,6 +220,44 @@ const skip = (n, why) => { SKIP++; console.log(`  \x1b[33m—\x1b[0m ${n}  (${wh
         getComputedStyle(g.querySelector(".where")).textDecorationLine.includes("line-through");`));
   else skip("a missing project directory is marked", "every project still exists");
 
+  console.log("5. usage history on the surface");
+  // Whether this machine has any history depends on how long the status line has
+  // been appending, so both outcomes are asserted — and the one that matters most
+  // on a fresh install is that nothing at all is drawn.
+  const hist = await (await fetch(`http://127.0.0.1:${PORT}/api/history`)).json();
+  const withRate = hist.filter(h => h.rate5 != null || h.rate7 != null);
+  if (withRate.length){
+    ok("a measurable account shows its burn rate", await js(`
+      return [...document.querySelectorAll(".surface .trend .rate")]
+        .some(e => /%\\/h$/.test(e.textContent.trim()));`));
+    ok("every projection is tagged for the ticker to update", await js(`
+      const hits = [...document.querySelectorAll(".trend .hit")];
+      return hits.every(h => !/100%/.test(h.textContent) || h.hasAttribute("data-eta"));`));
+    if (withRate.some(h => (h.samples || []).filter(s => s[1] != null).length >= 3))
+      ok("and a sparkline that stays inside its box", await js(`
+        const s = document.querySelector(".trend .spark");
+        if (!s) return false;
+        const b = s.getBoundingClientRect(), p = s.querySelector("polyline");
+        const ys = p.getAttribute("points").split(" ").map(t => +t.split(",")[1]);
+        return b.width > 0 && b.height > 0 &&
+               Math.min(...ys) >= 0 && Math.max(...ys) <= b.height;`));
+    else skip("the sparkline stays inside its box", "no window has 3+ samples yet");
+  } else {
+    ok("with no history, no half-answer is drawn", await js(`
+      return document.querySelectorAll(".trend").length === 0;`));
+    skip("the burn rate reads correctly", "no profile has enough history yet");
+    skip("the sparkline stays inside its box", "no profile has enough history yet");
+  }
+
+  const pick = await (await fetch(`http://127.0.0.1:${PORT}/api/next`)).json();
+  if (pick && pick.pick)
+    ok("the recommended account is the only one chipped", await js(`
+      const chips = [...document.querySelectorAll(".nextchip")];
+      if (chips.length !== 1) return false;
+      const card = chips[0].closest("[data-name]");
+      return card && card.dataset.name === ${JSON.stringify(pick.pick)};`));
+  else skip("the recommendation is chipped", "no account is usable right now");
+
   console.log("");
   console.log(`${PASS} passed, ${FAIL} failed${SKIP ? `, ${SKIP} skipped` : ""}`);
   ws.close();

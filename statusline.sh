@@ -168,6 +168,28 @@ process.stdin.on("end", () => {
           fs.writeFileSync(target,
             u5 + " " + u7 + " " + nowSec + " " + rst(rl.five_hour) + " " + rst(rl.seven_day) + "\n",
             { mode: 0o600 });
+          // Append the same reading to <target>.log — "ts u5 u7 r5 r7", timestamp
+          // first — which is what lets claudius show a burn rate instead of a
+          // lone number. Sampled every 120s (the cache is every 15s) and never
+          // rewritten here: pruning belongs to the reader, so an appender stays
+          // this cheap and cannot corrupt the file. Only the last 256 bytes are
+          // read, to find the previous sample time.
+          const logPath = target + ".log";
+          let lastTs = 0;
+          try {
+            const st = fs.statSync(logPath);
+            const len = Math.min(st.size, 256);
+            const buf = Buffer.alloc(len);
+            const fd = fs.openSync(logPath, "r");
+            try { fs.readSync(fd, buf, 0, len, st.size - len); } finally { fs.closeSync(fd); }
+            const lines = buf.toString("utf8").trim().split("\n");
+            lastTs = parseInt(lines[lines.length - 1].split(/\s+/)[0], 10) || 0;
+          } catch (e) {}
+          if (nowSec - lastTs >= 120) {
+            fs.appendFileSync(logPath,
+              nowSec + " " + u5 + " " + u7 + " " + rst(rl.five_hour) + " " + rst(rl.seven_day) + "\n",
+              { mode: 0o600 });
+          }
         }
       }
     }
