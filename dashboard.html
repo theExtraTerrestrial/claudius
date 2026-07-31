@@ -40,6 +40,25 @@
   <meta name="csrf-token" content="{{TOKEN}}">
   <title>Claude accounts</title>
 
+  <script>
+    /* Appearance is restored HERE, before the first paint, because the greys and
+       the severity set are attributes on <html> that the CSS below selects on.
+       Restoring them from the main script at the end of <body> would show the
+       default palette for a frame and then swap it — a visible flash on every
+       load. The cost is that the valid values appear twice in this file; the main
+       script re-validates against the real BIASES / SEVSETS and repairs the
+       attribute if these two ever drift apart. */
+    (() => {
+      const OK = { bias:["neutral","cool","warm"], sevset:["dusty","standard","punchy"] };
+      Object.keys(OK).forEach(k => {
+        try {
+          const v = localStorage.getItem("claudius." + k);
+          if (OK[k].indexOf(v) >= 0) document.documentElement.dataset[k] = v;
+        } catch (e) {}    /* storage can throw outright; the default stays */
+      });
+    })();
+  </script>
+
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
@@ -534,7 +553,7 @@
     background-size:280% 100%;animation:shimmer 1.5s linear infinite}
   @keyframes shimmer{0%{background-position:120% 0}100%{background-position:-120% 0}}
 
-  /* ── session log ────────────────────────────────────────────────────── */
+  /* ── log ─────────────────────────────────────────────────────────────── */
   .logpanel{margin-top:22px;border:1px solid var(--line);border-radius:14px;overflow:hidden;
     background:color-mix(in srgb,var(--surface) 80%,transparent);backdrop-filter:blur(10px)}
   .loghd{display:flex;align-items:center;gap:10px;padding:10px 13px;
@@ -563,6 +582,107 @@
   .k-sys .ic{color:var(--fg-3)} .k-err .ic{color:var(--crit)}
   .k-err .msg{color:var(--crit)}
   .logempty{padding:22px;text-align:center;color:var(--fg-3);font-size:12px}
+
+  /* ── linked sessions ──────────────────────────────────────────────────────
+     Same shell as the log panel. The rows deliberately carry no kebab: this
+     panel both clips (overflow:hidden) and blurs (backdrop-filter), so a menu
+     opened in a row would be clipped by the panel and trapped in its stacking
+     context — trap one at the top of this file. Which account a row copies for
+     is picked once in the header instead, where a plain cycling pill does the
+     job with no popover at all. */
+  /* The row height is declared, not discovered, so the panel can be sized to a
+     whole number of rows. A max-height that cuts the last row through the middle
+     reads as a rendering fault rather than as "there is more below". */
+  .sessbody{--srow-h:44px;max-height:calc(var(--srow-h) * 6);
+    overflow-y:auto;scrollbar-width:thin}
+  /* room to breathe where there is room: still whole rows, never a sliced one */
+  @media (min-height:1000px){ .sessbody{max-height:calc(var(--srow-h) * 9)} }
+  @media (min-height:1300px){ .sessbody{max-height:calc(var(--srow-h) * 13)} }
+  .srow{display:grid;
+    grid-template-columns:50px minmax(0,1.25fr) minmax(0,1fr) 44px 29px;
+    gap:10px;align-items:center;padding:7px 13px;font-size:12px;
+    height:var(--srow-h);box-sizing:border-box;
+    border-bottom:1px solid color-mix(in srgb,var(--fg) 4%,transparent)}
+  .srow:last-child{border-bottom:0}
+  .srow:hover{background:color-mix(in srgb,var(--fg) 3%,transparent)}
+  /* keyboard cursor. Selection is an action state, so it borrows the action
+     colour and none of the severity ones. */
+  .srow.cur{background:color-mix(in srgb,var(--action) 9%,transparent);
+    box-shadow:inset 2px 0 0 var(--action)}
+  .srow .age{font-family:var(--mono);font-size:10.5px;color:var(--fg-3);
+    font-variant-numeric:tabular-nums}
+  /* Transcript weight, shown only once it is worth knowing — a 30MB session takes
+     visible seconds to resume. Under a megabyte it would be noise. */
+  .srow .wt{font-family:var(--mono);font-size:9.5px;color:var(--fg-3);text-align:right;
+    font-variant-numeric:tabular-nums}
+  /* A project that no longer exists: said with type, not with a severity colour —
+     those belong to distance-from-a-limit and nothing else may borrow them. */
+  .srow.gone .where{text-decoration:line-through;text-decoration-thickness:1px}
+  .srow.gone .where .tag{margin-left:6px;text-decoration:none;color:var(--fg-3);
+    font-size:9px;letter-spacing:.1em;text-transform:uppercase}
+  .srow .lbl,.srow .where{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .srow .lbl{color:var(--fg)}
+  .srow .lbl.none{color:var(--fg-3)}
+  /* A title is a name; a prompt or a slash command is a quote from the session.
+     They read differently on purpose — quietly, via the quote marks and the mono
+     face, not with another colour. Severity owns colour here. */
+  .srow .lbl .qm{color:var(--fg-3)}
+  .srow .lbl.src-command{font-family:var(--mono);font-size:11px;color:var(--fg-2)}
+  .srow .where{font-family:var(--mono);font-size:10.5px;color:var(--fg-3)}
+  .srow .where .br{color:var(--fg-2)}
+  .srow .where .br::before{content:"·";margin:0 5px;color:var(--fg-3)}
+  /* the target pill: same restrained treatment as the palette rest control —
+     no fill, the profile name is the only lit pixel */
+  .sesstarget{appearance:none;font:inherit;font-size:10.5px;font-family:var(--mono);
+    cursor:pointer;display:flex;align-items:center;gap:6px;padding:4px 8px;
+    border:1px solid var(--line);border-radius:8px;background:transparent;
+    color:var(--fg-3);white-space:nowrap}
+  .sesstarget:hover{border-color:var(--line-2)}
+  .sesstarget b{color:var(--fg);font-weight:600}
+  .sesstarget .ms{font-size:13px}
+
+  /* ── session filters ──────────────────────────────────────────────────────
+     The scope control is a native <select> for one structural reason: its list
+     is painted by the browser, not the page, so it is the only menu that cannot
+     be clipped by this panel's overflow or trapped in its stacking context. A
+     custom popover here would hit both. */
+  .sessfilter{display:flex;align-items:center;gap:9px;padding:8px 13px;
+    border-bottom:1px solid var(--line)}
+  .sessfilter .ms{font-size:16px;color:var(--fg-3)}
+  .sessfilter input{flex:1;min-width:0;background:transparent;border:0;outline:0;font:inherit;
+    font-family:var(--mono);font-size:12px;color:var(--fg)}
+  .sessfilter input::placeholder{color:var(--fg-3)}
+  .sessfilter .qclear{appearance:none;border:0;background:transparent;cursor:pointer;
+    display:none;padding:0;color:var(--fg-3);line-height:0}
+  .sessfilter .qclear:hover{color:var(--fg)}
+  .sessfilter.has-q .qclear{display:block}
+  .sessscope{appearance:none;font:inherit;font-family:var(--mono);font-size:11px;cursor:pointer;
+    max-width:34%;padding:4px 24px 4px 8px;border:1px solid var(--line);border-radius:8px;
+    background:var(--raised);color:var(--fg-2);text-overflow:ellipsis;
+    /* the caret is drawn here because appearance:none removes the native one */
+    background-image:linear-gradient(45deg,transparent 50%,var(--fg-3) 50%),
+      linear-gradient(135deg,var(--fg-3) 50%,transparent 50%);
+    background-position:calc(100% - 13px) center,calc(100% - 8px) center;
+    background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+  .sessscope:hover{border-color:var(--line-2);color:var(--fg)}
+  .sessscope:focus-visible{outline:2px solid var(--action);outline-offset:1px}
+  /* the popup list is OS-painted and inherits nothing, so the dark colours have
+     to be stated on the options themselves */
+  .sessscope option{background:var(--raised-2);color:var(--fg)}
+  /* At 30% of the action colour this read as a grey smudge on near-black — you
+     could see something had happened but not that it was a match. */
+  .srow mark{background:color-mix(in srgb,var(--action) 58%,transparent);
+    color:var(--fg);font-weight:600;border-radius:2px;padding:0 1px}
+
+  /* The pool is bigger than the page asks for by default; this is the row that
+     says so and offers the rest, rather than letting 40 read as all of them. */
+  .sessmore{display:flex;align-items:center;justify-content:center;gap:8px;
+    padding:9px 13px;border-top:1px solid var(--line)}
+  .sessmore button{appearance:none;font:inherit;font-size:11px;font-family:var(--mono);
+    cursor:pointer;color:var(--fg-2);background:transparent;border:1px solid var(--line);
+    border-radius:8px;padding:4px 10px}
+  .sessmore button:hover{color:var(--fg);border-color:var(--line-2)}
+  .sessmore button[disabled]{opacity:.6;cursor:default}
 
   .toast{position:fixed;left:50%;bottom:22px;transform:translate(-50%,14px);
     background:var(--raised-2);border:1px solid var(--line-2);color:var(--fg);border-radius:12px;
@@ -620,7 +740,29 @@
 
   <div class="logpanel">
     <div class="loghd">
-      <span class="ttl"><span class="ms">receipt_long</span> Session log</span>
+      <span class="ttl"><span class="ms">forum</span> Linked sessions</span>
+      <span class="cnt" id="sessCnt"></span>
+      <span class="grow"></span>
+      <button class="sesstarget" id="sessTargetBtn"
+        title="which account the copied commands resume with">
+        <span class="ms">swap_horiz</span>resume as <b id="sessTargetWho">…</b></button>
+      <button class="icobtn" id="sessReload" title="re-scan the session pool"
+        aria-label="re-scan sessions"><span class="ms">refresh</span></button>
+    </div>
+    <div class="sessfilter" id="sessFilter">
+      <span class="ms">search</span>
+      <input id="sessQ" placeholder="title, path or branch…  (press /)" spellcheck="false"
+        autocomplete="off" aria-label="search sessions">
+      <button class="qclear" id="sessQClear" title="clear the search"
+        aria-label="clear search"><span class="ms">close</span></button>
+      <select class="sessscope" id="sessScope" aria-label="scope to a project"></select>
+    </div>
+    <div class="sessbody" id="sessBody"></div>
+  </div>
+
+  <div class="logpanel">
+    <div class="loghd">
+      <span class="ttl"><span class="ms">receipt_long</span> Log</span>
       <span class="cnt" id="logCnt"></span>
       <span class="grow"></span>
       <span class="cnt">Haiku calls <b id="callTally">0</b></span>
@@ -667,10 +809,27 @@
             <span class="fld orbits"><i></i><i></i><i></i></span>` },
   ];
 
-  /* Identity: the profile name plus one salt minted per page load. The pairings
-     only need to differ from each other on screen, not persist — so there's no
-     storage and no de-duplication pass. If two collide, the kebab picks another. */
-  const SALT = Math.random().toString(36).slice(2, 10);
+  /* ── remembered in the browser ───────────────────────────────────────────
+     Everything kept here is per-browser decoration keyed by profile name —
+     never account state, which belongs to the CLI. localStorage can throw
+     outright rather than return null (Safari private mode, a file:// open, a
+     storage policy), so every access goes through this pair and a failure
+     degrades to "nothing sticks" instead of taking the page down. */
+  const store = {
+    get(k){ try { return localStorage.getItem("claudius." + k); } catch(e){ return null; } },
+    set(k, v){ try { localStorage.setItem("claudius." + k, v); } catch(e){} },
+  };
+
+  /* Identity: the profile name plus one salt. The pairings only need to differ
+     from each other on screen — but they do have to hold still, or every reload
+     rerolls each card's hue and geometry and a style chosen against one of them
+     lands on a different card. So the salt is minted once and kept. There's
+     still no de-duplication pass; if two collide, the kebab picks another. */
+  const SALT = (() => {
+    let s = store.get("salt");
+    if (!s){ s = Math.random().toString(36).slice(2, 10); store.set("salt", s); }
+    return s;
+  })();
   const HUES = [186, 206, 226, 262, 292, 320];
   function fnv1a(s){
     let h = 0x811c9dc5;
@@ -685,7 +844,24 @@
       base:0.90 + ((h >>> 23) & 7) / 34, pts:5 + ((h >>> 26) & 3),
       pref:h % FIELDS.length };
   }
-  const STYLE = {};                        /* name → field index, session only */
+  /* name → field index: explicit choices only. A name absent from it falls back
+     to the field its hash prefers, so a profile added later still arrives with
+     a look. Stored indices are range-checked on read — FIELDS can grow or lose
+     an entry between versions, and an index off the end would leave fieldFor
+     returning undefined on every card. */
+  const STYLE = (() => {
+    const out = {};
+    try{
+      const saved = JSON.parse(store.get("style") || "{}");
+      if (saved && typeof saved === "object")
+        Object.keys(saved).forEach(k => {
+          const i = saved[k];
+          if (Number.isInteger(i) && i >= 0 && i < FIELDS.length) out[k] = i;
+        });
+    }catch(e){}
+    return out;
+  })();
+  const saveStyle = () => store.set("style", JSON.stringify(STYLE));
   const fieldFor = n => FIELDS[STYLE[n] != null ? STYLE[n] : identity(n).pref];
 
   function constelHTML(id){
@@ -740,7 +916,7 @@
   /* ── reset display: countdown / clock / total, remembered in the browser ── */
   const MODES = ["countdown","clock","total"];
   const MODE_LABEL = { countdown:"countdown", clock:"clock time", total:"total left" };
-  let resetMode = localStorage.getItem("claudius.resetMode");
+  let resetMode = store.get("resetMode");
   if (!MODES.includes(resetMode)) resetMode = "countdown";
 
   function dur(s){
@@ -792,7 +968,7 @@
     return a.concat(r);
   };
 
-  /* ═══════════ session log ════════════════════════════════════════════ */
+  /* ═══════════ log ════════════════════════════════════════════════════ */
   const LOG = [];
   const LOG_ICON = { live:"bolt", cache:"cached", switch:"swap_horiz", copy:"content_copy",
                      sys:"terminal", err:"error" };
@@ -856,7 +1032,10 @@
       </div>`;
   }
 
-  function kebab(name){
+  /* The active account is the one you never have to name — `claude` alone runs
+     it — so its copy lives in the menu, and the cards that do need
+     `claudius run <name>` carry the button in the open. */
+  function kebab(name, copyInMenu){
     const cur = fieldFor(name);
     return `<span class="kebab">
       <button class="icobtn" data-kebab="${esc(name)}" title="more"
@@ -865,8 +1044,8 @@
         <div class="ksec">${esc(name)}</div>
         <button data-kact="live:${esc(name)}"><span class="ms">bolt</span>
           Read live limits<span class="meta">1 call</span></button>
-        <button data-kact="copy:${esc(name)}"><span class="ms">content_copy</span>
-          Copy run command</button>
+        ${copyInMenu ? `<button data-kact="copy:${esc(name)}">
+          <span class="ms">content_copy</span>Copy run command</button>` : ""}
         <div class="sep"></div>
         <div class="ksec">card style</div>
         <div class="styles">${FIELDS.map((f, i) => `
@@ -895,10 +1074,7 @@
             <div class="hmail">${ident}</div>
           </div>
           <div class="hacts">
-            <button class="icobtn" data-copy="${esc(p.name)}"
-              title="copy “claudius run ${esc(p.name)}”" aria-label="copy run command">
-              <span class="ms">content_copy</span></button>
-            ${kebab(p.name)}
+            ${kebab(p.name, true)}
           </div>
         </div>
         <div class="windows">
@@ -939,9 +1115,12 @@
           <span class="rst" data-reset="${p.r7 || ""}">${resetText(p.r7)}</span></div>
         <div class="cfoot">
           <span class="cache ${isStale(p.uts) ? "stale" : ""}">cache ${ago(p.uts)}</span>
+          <button class="icobtn" data-copy="${esc(p.name)}"
+            title="copy “claudius run ${esc(p.name)}”" aria-label="copy run command">
+            <span class="ms">content_copy</span></button>
           <button class="selpill" data-sel="${esc(p.name)}"><span class="dot"></span>
             <span class="txt">Use</span></button>
-          ${kebab(p.name)}
+          ${kebab(p.name, false)}
         </div>
       </div></div>`;
   }
@@ -991,6 +1170,31 @@
   const SEV_SW = { dusty:["#71AF8E","#B4924F","#BE6E7E"],
                    standard:["#52D096","#DDAE52","#E76A80"],
                    punchy:["#1CF29C","#FFBE2E","#FF4670"] };
+
+  /* The two attribute-driven looks, and the defaults declared on <html>. The head
+     script has already restored these before the first paint; this is the
+     authoritative check, so a value it let through that isn't in these lists —
+     hand-edited storage, or the two copies drifting — is repaired rather than
+     left to render as a broken palette and a nonsense name in the menu. */
+  const LOOKS = { bias:BIASES, sevset:SEVSETS };
+  const LOOK_DEFAULT = { bias:"neutral", sevset:"punchy" };
+  Object.keys(LOOKS).forEach(k => {
+    const root = document.documentElement;
+    /* the head copy may have let something through, or the two lists may have
+       drifted — against these lists the attribute is what gets repaired */
+    if (LOOKS[k].indexOf(root.dataset[k]) < 0) root.dataset[k] = LOOK_DEFAULT[k];
+    /* and a stored value this build no longer knows is cleaned rather than left
+       to be silently ignored on every future load. An unset key stays unset. */
+    const stored = store.get(k);
+    if (stored != null && LOOKS[k].indexOf(stored) < 0) store.set(k, root.dataset[k]);
+  });
+  const cycleLook = w => {
+    const root = document.documentElement, list = LOOKS[w];
+    const next = list[(list.indexOf(root.dataset[w]) + 1) % list.length];
+    root.dataset[w] = next;
+    store.set(w, next);
+  };
+
   let palQ = "";
   function palRows(){
     const q = palQ.toLowerCase(), hit = s => !q || s.toLowerCase().includes(q);
@@ -1018,13 +1222,18 @@
       apps.push(`<button class="palrow" data-cycle="reset"><span class="ms">schedule</span>
         <span style="font-size:13px">Reset display</span>
         <span class="meta">${MODE_LABEL[resetMode]} ›</span></button>`);
-    if (hit("greys") || hit("grey") || hit("appearance"))
-      apps.push(`<button class="palrow" data-cycle="bias"><span class="ms">contrast</span>
-        <span style="font-size:13px">Greys</span>
+    /* Named for what they do to the page, not for the internals they drive: the
+       attributes stay `bias` / `sevset` and severity keeps its meaning in the CSS
+       and the design rules at the top of this file. The old words are still
+       searchable so the palette answers to either. */
+    if (hit("color") || hit("colour") || hit("greys") || hit("grey") || hit("tint")
+        || hit("appearance"))
+      apps.push(`<button class="palrow" data-cycle="bias"><span class="ms">palette</span>
+        <span style="font-size:13px">Color</span>
         <span class="meta">${root.dataset.bias} ›</span></button>`);
-    if (hit("severity") || hit("sev") || hit("appearance"))
-      apps.push(`<button class="palrow" data-cycle="sevset"><span class="ms">palette</span>
-        <span style="font-size:13px">Severity</span>
+    if (hit("contrast") || hit("severity") || hit("sev") || hit("appearance"))
+      apps.push(`<button class="palrow" data-cycle="sevset"><span class="ms">contrast</span>
+        <span style="font-size:13px">Contrast</span>
         <span class="swatch">${SEV_SW[root.dataset.sevset].map(c =>
           `<i style="background:${c}"></i>`).join("")}</span>
         <span class="meta" style="margin-left:8px">${root.dataset.sevset} ›</span></button>`);
@@ -1084,7 +1293,12 @@
     });
     $$(".peers .cell.follow .k").forEach(el => { el.textContent = resetLabel(); });
   }
-  function renderAll(){ renderStage(); paintPal(); setAmbient(activeProfile() || PROFILES[0]); }
+  /* paintSessions is in here because switching the active account changes the
+     shape of every copied command — the active one takes bare `claude`. */
+  function renderAll(){
+    renderStage(); paintPal(); paintSessions();
+    setAmbient(activeProfile() || PROFILES[0]);
+  }
 
   /* ═══════════ events ═════════════════════════════════════════════════ */
   const DUR = { reading:1400, rippling:1450, blooming:1400 };
@@ -1113,9 +1327,23 @@
     return data;
   }
 
+  /* Drop choices for profiles that are gone, so a browser doesn't carry a
+     removed name forever. Only ever runs against a list that actually loaded —
+     an empty one means the read failed or every profile really is gone, and in
+     neither case is forgetting the styles the helpful move. */
+  function pruneStyle(){
+    if (!PROFILES.length) return;
+    const live = {};
+    PROFILES.forEach(p => { live[p.name] = 1; });
+    let cut = false;
+    Object.keys(STYLE).forEach(n => { if (!live[n]){ delete STYLE[n]; cut = true; } });
+    if (cut) saveStyle();
+  }
+
   async function load(quiet){
     try{
       PROFILES = await getProfiles();
+      pruneStyle();
       renderAll();
       paintResets();
       if (!quiet) log("sys", `loaded ${PROFILES.length} profile${
@@ -1230,22 +1458,317 @@
     for (const n of names){ await readLive(n); await sleep(120); }
   }
 
-  function copyRun(name){
-    const cmd = `claudius run ${name}`;
+  /* One clipboard path for both the profile cards and the session rows. `echo`
+     is the button that should tick over to a checkmark; the toast covers the
+     copies fired from a menu, where no button is left on screen to answer. */
+  function copyCmd(cmd, echo){
     navigator.clipboard?.writeText(cmd).catch(() => {});
     log("copy", `copied <b>${esc(cmd)}</b>`);
     toast(`Copied “${cmd}”`, "content_copy");
-    /* the button answers for itself — the toast is for the ones in the menu */
-    $$(`button[data-copy="${name}"] .ms`).forEach(i => {
+    $$(echo).forEach(i => {
       i.textContent = "check";
       i.style.color = "var(--ok)";
       setTimeout(() => { i.textContent = "content_copy"; i.style.color = ""; }, 1100);
     });
   }
+  function copyRun(name){
+    copyCmd(`claudius run ${name}`, `button[data-copy="${name}"] .ms`);
+  }
+
+  /* ═══════════ linked sessions ════════════════════════════════════════
+     `run` symlinks ~/.claude/projects into every wired profile, so the session
+     pool is shared, not per-account: one list, and any profile can resume any
+     row. That's why this is a page-level panel and not something on a card.
+
+     Scanning costs a subprocess (a Ruby scan over the transcript store), so it
+     runs on demand and on boot — deliberately NOT on the 30s watch tick, which
+     is supposed to be the free one. */
+  let SESSIONS = null;                     /* null = not read yet, [] = empty pool */
+  let sessTarget = store.get("sessTarget") || "";
+  /* The project scope is remembered — "I work in this repo" is a standing
+     preference, and the control shows what it is. The query is not: a search box
+     that refills itself on open would hide rows behind a filter nobody typed
+     this session. */
+  let sessScope = store.get("sessScope") || "";
+  let sessQ = "";
+  /* How many rows were asked for. 0 means the whole pool — a deliberate request,
+     not a default, because scanning everything costs a subprocess over every
+     transcript in the store. */
+  let sessLimit = 40;
+  /* Keyboard cursor into the *visible* rows, -1 when nothing is picked. Filtering
+     changes what is visible, so it is reset whenever the filter does. */
+  let sessCursor = -1;
+
+  /* Which account the copied commands resume with. A remembered name that has
+     since been removed falls back to the active one rather than copying a
+     command for a profile that is gone. */
+  function sessWho(){
+    if (sessTarget && PROFILES.some(p => p.name === sessTarget)) return sessTarget;
+    return activeName() || (PROFILES[0] || {}).name || "";
+  }
+  function cycleSessWho(){
+    if (!PROFILES.length) return;
+    const names = PROFILES.map(p => p.name);
+    const i = names.indexOf(sessWho());
+    sessTarget = names[(i + 1) % names.length];
+    store.set("sessTarget", sessTarget);
+    paintSessions();
+  }
+
+  /* Only quote when the shell would care — an unquoted path reads better, and
+     most of these are plain. */
+  const shq = s => /^[A-Za-z0-9_@%+=:,.\/-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
+
+  /* The active account is reached by bare `claude` — `claudius run` is only how
+     you reach a NON-active one, so the command shape follows the target. The cd
+     is not decoration: --resume resolves a session against the project it
+     belongs to, so the wrong directory finds nothing. */
+  function resumeCmd(s, who){
+    const inner = who && who !== activeName()
+      ? `claudius run ${who} --resume ${s.id}`
+      : `claude --resume ${s.id}`;
+    return s.cwd ? `cd ${shq(s.cwd)} && ${inner}` : inner;
+  }
+
+  const sessAge = t => {
+    if (!t) return "—";
+    const d = Math.max(0, Math.floor(Date.now() / 1000) - t);
+    if (d < 60)    return d + "s";
+    if (d < 3600)  return Math.floor(d / 60) + "m";
+    if (d < 86400) return Math.floor(d / 3600) + "h";
+    return Math.floor(d / 86400) + "d";
+  };
+  /* The pool is keyed by cwd, so the basename is what distinguishes one row from
+     another; the full path is worth having but not worth the width. The home
+     directory is the exception — its basename is a username, which in a narrow
+     column is indistinguishable from a profile name, so it keeps the `~` the CLI
+     already wrote for it. */
+  /* A transcript that never recorded a cwd still belongs to a project: the pool is
+     keyed by directory, so a sibling row under the same key already knows the path.
+     Falling back to the raw key would put `-home-axius-workspace-realizacija` on
+     screen — an internal encoding, and one that reads as a different project from
+     its own siblings. Memoised on the array identity, so a reload rebuilds it and
+     a repaint does not. */
+  let dirPaths = { src:null, map:{} };
+  function dirPathMap(){
+    if (dirPaths.src === SESSIONS) return dirPaths.map;
+    const map = {};
+    (SESSIONS || []).forEach(s => {
+      const k = s.dirkey || "";
+      if (k && !map[k] && (s.short || s.cwd)) map[k] = s.short || s.cwd;
+    });
+    dirPaths = { src:SESSIONS, map };
+    return map;
+  }
+  /* Written the way a person writes it, for the tooltip. */
+  const projPath = s => s.short || s.cwd || dirPathMap()[s.dirkey] || "unknown project";
+  const projName = s => {
+    const p = projPath(s);
+    if (p === "~" || p === "unknown project") return p;
+    const parts = p.replace(/\/+$/, "").split("/");
+    return parts[parts.length - 1] || p;
+  };
+
+  /* Only once it is worth knowing: under a megabyte this is noise, and the exact
+     byte count never matters. */
+  const weightOf = s => {
+    const b = Number(s.size) || 0;
+    if (b < 1048576) return "";
+    const mb = b / 1048576;
+    return mb >= 10 ? `${Math.round(mb)}MB` : `${mb.toFixed(1)}MB`;
+  };
+  const stamp = t => {
+    if (!t) return "never";
+    try { return new Date(t * 1000).toLocaleString(); }
+    catch (e) { return String(t); }
+  };
+
+  /* One project per dirkey, labelled by its basename and ordered by how recently
+     it was touched — the pool is keyed by directory, so dirkey is the identity
+     and the path is only for display. */
+  function sessProjects(){
+    const seen = new Map();
+    (SESSIONS || []).forEach(s => {
+      const k = s.dirkey || s.cwd || "";
+      const cur = seen.get(k);
+      if (cur){ cur.n++; if (s.mts > cur.mts) cur.mts = s.mts; }
+      else seen.set(k, { key:k, name:projName(s), path:s.cwd || s.dirkey || "", n:1, mts:s.mts });
+    });
+    return [...seen.values()].sort((a, b) => b.mts - a.mts);
+  }
+
+  /* Substring, case-insensitive, over every field a row actually shows plus the
+     id — pasting a session id into the box should find it. */
+  function sessMatch(s, q){
+    if (!q) return true;
+    return [s.label, s.cwd, s.branch, s.id, projName(s), projPath(s)]
+      .some(v => v && String(v).toLowerCase().includes(q));
+  }
+  function visibleSessions(){
+    const q = sessQ.trim().toLowerCase();
+    return (SESSIONS || []).filter(s =>
+      (!sessScope || (s.dirkey || s.cwd || "") === sessScope) && sessMatch(s, q));
+  }
+
+  /* Escape first, then wrap: marking up the raw string and escaping afterwards
+     would escape the <mark> too, and matching against already-escaped text would
+     let a query like "amp" light up inside an entity. */
+  function markHits(text, q){
+    const s = String(text ?? "");
+    if (!q) return esc(s);
+    const hay = s.toLowerCase();
+    let out = "", i = 0;
+    for (;;){
+      const at = hay.indexOf(q, i);
+      if (at < 0) break;
+      out += esc(s.slice(i, at)) + "<mark>" + esc(s.slice(at, at + q.length)) + "</mark>";
+      i = at + q.length;
+    }
+    return out + esc(s.slice(i));
+  }
+
+  /* Where a label came from, in the row's tooltip — otherwise a first prompt
+     standing in for a title is indistinguishable from one, and you'd wonder why
+     some rows read like someone talking. */
+  const LSRC_HINT = {
+    prompt:"first prompt", last:"last prompt", command:"opening command",
+    slug:"session slug", title:"session title",
+  };
+  const sessLabelHint = s => s.label
+    ? `${s.label}${LSRC_HINT[s.lsrc] ? `  ·  ${LSRC_HINT[s.lsrc]}` : ""}`
+    : `nothing was said in this session  ·  ${s.id}`;
+
+  /* Quoted for the sources that are someone's words rather than a name. The
+     quotes sit outside the highlight so a search never marks punctuation the
+     transcript doesn't contain. */
+  function sessLabelHTML(s, q){
+    if (!s.label) return "empty session";
+    const body = markHits(s.label, q);
+    return (s.lsrc === "prompt" || s.lsrc === "last")
+      ? `<span class="qm">“</span>${body}<span class="qm">”</span>` : body;
+  }
+
+  function paintScope(){
+    const sel = $("#sessScope"), projects = sessProjects();
+    /* A remembered project with nothing left in the pool would filter every row
+       away with no way to tell why, so it reverts to everything — but only once
+       the pool has actually been read. Before that the list is empty for lack of
+       data, and clearing here would drop the preference on every boot. */
+    if (SESSIONS != null && sessScope && !projects.some(p => p.key === sessScope)){
+      sessScope = "";
+      store.set("sessScope", "");
+    }
+    const total = (SESSIONS || []).length;
+    sel.innerHTML = `<option value="">all projects · ${total}</option>` +
+      projects.map(p => `<option value="${esc(p.key)}"${p.key === sessScope ? " selected" : ""}
+        title="${esc(p.path)}">${esc(p.name)} · ${p.n}</option>`).join("");
+    sel.value = sessScope;
+    sel.disabled = !total;
+  }
+
+  function paintSessions(){
+    const who = sessWho();
+    $("#sessTargetWho").textContent = who || "no profile";
+    $("#sessTargetBtn").hidden = PROFILES.length < 1;
+    const body = $("#sessBody"), cnt = $("#sessCnt");
+    const filter = $("#sessFilter");
+    filter.classList.toggle("has-q", sessQ !== "");
+    paintScope();
+    if (SESSIONS == null){
+      cnt.textContent = "";
+      filter.hidden = true;
+      body.innerHTML = `<div class="logempty">reading the session pool…</div>`;
+      return;
+    }
+    filter.hidden = !SESSIONS.length;
+    if (!SESSIONS.length){
+      cnt.textContent = "";
+      body.innerHTML = `<div class="logempty">no sessions in the shared pool yet</div>`;
+      return;
+    }
+    const q = sessQ.trim().toLowerCase(), rows = visibleSessions();
+    /* Say "N of M" whenever anything is hidden — a filtered count that reads like
+       a total is how you conclude sessions went missing. */
+    cnt.innerHTML = rows.length === SESSIONS.length
+      ? `<b>${SESSIONS.length}</b> shared`
+      : `<b>${rows.length}</b> of ${SESSIONS.length}`;
+    if (!rows.length){
+      body.innerHTML = `<div class="logempty">nothing matches${
+        q ? ` “${esc(sessQ.trim())}”` : ""}${sessScope ? " in this project" : ""}</div>`;
+      return;
+    }
+    body.innerHTML = rows.map((s, i) => {
+      const cmd = resumeCmd(s, who);
+      const gone = s.exists === false;
+      /* The command opens with a cd, so a missing directory means it fails on its
+         first clause. Still copyable — the directory may be coming back — but the
+         row and the tooltip both say so. */
+      const cmdHint = gone
+        ? `${projPath(s)} no longer exists — this command will fail at the cd`
+        : `copy “${cmd}”`;
+      return `<div class="srow${gone ? " gone" : ""}${i === sessCursor ? " cur" : ""}"
+        data-srow="${esc(s.id)}">
+        <span class="age" title="last active ${esc(stamp(s.mts))}">${esc(sessAge(s.mts))}</span>
+        <span class="lbl ${s.label ? `src-${esc(s.lsrc || "title")}` : "none"}"
+          title="${esc(sessLabelHint(s))}">${sessLabelHTML(s, q)}</span>
+        <span class="where" title="${esc(projPath(s))}">${markHits(projName(s), q)}${
+          s.branch ? `<span class="br">${markHits(s.branch, q)}</span>` : ""}${
+          gone ? `<span class="tag">gone</span>` : ""}</span>
+        <span class="wt" title="${esc(s.size ? s.size + " bytes" : "")}">${esc(weightOf(s))}</span>
+        <button class="icobtn" data-scopy="${esc(s.id)}"
+          title="${esc(cmdHint)}" aria-label="copy resume command">
+          <span class="ms">content_copy</span></button>
+      </div>`;
+    }).join("");
+    /* Only offered while the fetch was capped and came back full — that is the
+       only time there might be more behind it. */
+    if (sessLimit > 0 && SESSIONS.length >= sessLimit)
+      body.insertAdjacentHTML("beforeend", `<div class="sessmore">
+        <button id="sessAll">show the whole pool</button></div>`);
+  }
+
+  /* Arrow keys walk the list and Enter copies, so a search can be finished without
+     reaching for the mouse. Clamped rather than wrapping — running off the end of
+     a long list by holding a key is worse than stopping at it. */
+  function moveSessCursor(delta){
+    const rows = visibleSessions();
+    if (!rows.length) return;
+    const next = sessCursor < 0
+      ? (delta > 0 ? 0 : rows.length - 1)
+      : Math.min(rows.length - 1, Math.max(0, sessCursor + delta));
+    if (next === sessCursor) return;
+    sessCursor = next;
+    paintSessions();
+    const el = $(`[data-srow="${rows[sessCursor].id}"]`);
+    if (el) el.scrollIntoView({ block:"nearest" });
+  }
+
+  async function loadSessions(quiet){
+    try{
+      const r = await fetch(`/api/sessions?limit=${sessLimit}`, { cache:"no-store" });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const data = await r.json();
+      SESSIONS = Array.isArray(data) ? data : [];
+      sessCursor = -1;
+      paintSessions();
+      if (!quiet) log("cache", `read ${SESSIONS.length} shared session${
+        SESSIONS.length === 1 ? "" : "s"}${sessLimit ? " (newest first)" : " — the whole pool"}`,
+        "free");
+    }catch(e){
+      SESSIONS = SESSIONS || [];
+      paintSessions();
+      log("err", `could not read the session pool — ${esc(e.message)}`);
+    }
+  }
 
   /* ═══════════ watch cache ════════════════════════════════════════════ */
   const POLL_S = 30, RING = 2 * Math.PI * 11;
   let pollOn = false, pollLeft = POLL_S, pollT = null;
+  /* Watching is remembered because it's a working preference, not an action —
+     leave it on, come back tomorrow, and the page should still be watching.
+     The countdown is not remembered: a reload re-reads the cache anyway, so the
+     window starts fresh rather than resuming mid-flight. */
+  const pollWanted = () => store.get("watch") === "1";
   function paintRing(){
     const r = $("#pollToggle .rv");
     if (!r) return;
@@ -1255,8 +1778,12 @@
       ? `next free cache read in ${pollLeft}s`
       : "Re-read the local cache every 30s — free, no API calls";
   }
-  function togglePoll(){
-    pollOn = !pollOn;
+  const togglePoll = () => setPoll(!pollOn);
+  /* resumed: restoring a remembered state on boot rather than a press now, so
+     the log says so and the preference isn't rewritten with what it just read. */
+  function setPoll(on, resumed){
+    pollOn = on;
+    if (!resumed) store.set("watch", pollOn ? "1" : "0");
     $("#pollToggle").setAttribute("aria-checked", String(pollOn));
     pollLeft = POLL_S;
     clearInterval(pollT);
@@ -1273,8 +1800,9 @@
         }
         paintRing();
       }, 1000);
-      log("sys", "watching the cache — a free re-read every 30s");
-    } else {
+      log("sys", resumed ? "resumed watching the cache — a free re-read every 30s"
+                         : "watching the cache — a free re-read every 30s");
+    } else if (!resumed){
       log("sys", "stopped watching the cache");
     }
     paintRing();
@@ -1284,6 +1812,37 @@
   document.addEventListener("click", e => {
     if (e.target.closest("#pollToggle")) return togglePoll();
     if (e.target.closest("#logClear")){ LOG.length = 0; paintLog(); return; }
+    if (e.target.closest("#sessTargetBtn")) return cycleSessWho();
+    if (e.target.closest("#sessQClear")){
+      sessQ = "";
+      sessCursor = -1;
+      $("#sessQ").value = "";
+      paintSessions();
+      $("#sessQ").focus();
+      return;
+    }
+    if (e.target.closest("#sessAll")){
+      sessLimit = 0;                          /* 0 = everything */
+      $("#sessAll").disabled = true;
+      $("#sessAll").textContent = "reading the whole pool…";
+      loadSessions();
+      return;
+    }
+    /* Clicking a row adopts it as the keyboard cursor, so the two ways of moving
+       through the list share one position instead of fighting over it. */
+    const srow = e.target.closest("[data-srow]");
+    if (srow && !e.target.closest("button")){
+      sessCursor = visibleSessions().findIndex(s => s.id === srow.dataset.srow);
+      paintSessions();
+      return;
+    }
+    if (e.target.closest("#sessReload")){ SESSIONS = null; paintSessions(); loadSessions(); return; }
+    const sc = e.target.closest("button[data-scopy]");
+    if (sc){
+      const s = (SESSIONS || []).find(x => x.id === sc.dataset.scopy);
+      if (s) copyCmd(resumeCmd(s, sessWho()), `button[data-scopy="${s.id}"] .ms`);
+      return;
+    }
 
     if (e.target.closest("#palBtn")){
       const pop = $("#palPop"), was = pop.classList.contains("on");
@@ -1296,12 +1855,10 @@
       const w = cyc.dataset.cycle;
       if (w === "reset"){
         resetMode = MODES[(MODES.indexOf(resetMode) + 1) % MODES.length];
-        localStorage.setItem("claudius.resetMode", resetMode);
+        store.set("resetMode", resetMode);
         renderStage(); paintResets();
       } else {
-        const list = w === "bias" ? BIASES : SEVSETS;
-        const cur = document.documentElement.dataset[w];
-        document.documentElement.dataset[w] = list[(list.indexOf(cur) + 1) % list.length];
+        cycleLook(w);
         ambFor = null;                       /* the room re-tints with the palette */
         renderStage(); paintResets(); setAmbient(activeProfile() || PROFILES[0], true);
       }
@@ -1334,7 +1891,7 @@
     const st = e.target.closest("button[data-style]");
     if (st){
       const [n, i] = st.dataset.style.split(":");
-      STYLE[n] = +i;
+      STYLE[n] = +i; saveStyle();
       closeMenus();
       ambFor = null;
       renderStage(); paintResets();
@@ -1350,7 +1907,7 @@
       if (kind === "shuffle"){
         const cur = FIELDS.indexOf(fieldFor(who));
         let i; do { i = Math.floor(Math.random() * FIELDS.length); } while (i === cur);
-        STYLE[who] = i;
+        STYLE[who] = i; saveStyle();
         ambFor = null;
         renderStage(); paintResets();
         if (who === activeName()) setAmbient(activeProfile() || PROFILES[0]);
@@ -1370,7 +1927,57 @@
   document.addEventListener("input", e => {
     if (e.target.id === "palQ"){ palQ = e.target.value.trim(); $("#palList").innerHTML = palRows(); }
   });
-  document.addEventListener("keydown", e => { if (e.key === "Escape") closeMenus(); });
+  /* Both filters reset the cursor: it indexes into what is visible, and what is
+     visible just changed underneath it. */
+  $("#sessQ").addEventListener("input", e => {
+    sessQ = e.target.value; sessCursor = -1; paintSessions();
+  });
+  $("#sessScope").addEventListener("change", e => {
+    sessScope = e.target.value;
+    sessCursor = -1;
+    store.set("sessScope", sessScope);
+    paintSessions();
+  });
+
+
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape"){
+      closeMenus();
+      /* Escape in the box clears the filter before it does anything else —
+         the shortcut that got you there should get you back. */
+      if (e.target === $("#sessQ") && sessQ !== ""){
+        sessQ = ""; sessCursor = -1; e.target.value = ""; paintSessions();
+      }
+      return;
+    }
+    /* The arrows drive the list from the search box (where you already are after
+       `/`) or from a row. Anywhere else they still scroll the page. */
+    const inList = e.target === $("#sessQ") || (e.target.closest && e.target.closest("[data-srow]"));
+    if (inList && (e.key === "ArrowDown" || e.key === "ArrowUp")){
+      e.preventDefault();
+      moveSessCursor(e.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+    if (inList && e.key === "Enter"){
+      const rows = visibleSessions();
+      const s = rows[sessCursor];
+      if (s){
+        e.preventDefault();
+        copyCmd(resumeCmd(s, sessWho()), `button[data-scopy="${s.id}"] .ms`);
+      }
+      return;
+    }
+    /* `/` jumps to the search, but not while something already has typing focus,
+       or it would eat the slash mid-path. */
+    const t = e.target;
+    const typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
+      t.tagName === "SELECT" || t.isContentEditable);
+    if (e.key === "/" && !typing && !e.metaKey && !e.ctrlKey && !e.altKey){
+      e.preventDefault();
+      $("#sessQ").focus();
+      $("#sessQ").select();
+    }
+  });
   document.addEventListener("pointermove", e => {
     const c = e.target.closest?.(".surface");
     if (!c) return;
@@ -1385,7 +1992,10 @@
   skeleton();
   paintLog();
   paintRing();
-  load();
+  if (pollWanted()) setPoll(true, true);   /* the pill paints correct on first frame */
+  paintSessions();
+  load();                                  /* renderAll repaints the rows when it lands */
+  loadSessions(true);                      /* the pool doesn't wait on the profile list */
 })();
 </script>
 </body>

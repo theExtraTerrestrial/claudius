@@ -173,9 +173,10 @@ the hero slot as the switch lands.
   30-second ring — that part is free and never calls the API.
 - **The palette** (the `GLOBAL ·` chip) is one place to switch accounts, read all
   limits, and set preferences: reset display (**countdown** / **clock** /
-  **total**), grey bias, and severity intensity. Reset display is remembered in
-  the browser.
-- **The session log** records everything the page did since you opened it —
+  **total**), colour bias, and contrast intensity. All three are remembered in
+  the browser, along with the card styles, the watch toggle and the session
+  filters.
+- **The log** records everything the page did since you opened it —
   every live read with its result, every free cache re-read, every switch — each
   row priced, so the cost history sits beside the tally.
 - The page markup lives in `dashboard.html` (edit it directly); the sidecar reads
