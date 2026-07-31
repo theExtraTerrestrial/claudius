@@ -7,6 +7,9 @@ SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/claudius"
 # `ruby` here is an asdf shim that resolves installs relative to $HOME; point it at
 # the real data dir so the fake HOME does not break the interpreter itself.
 ASDF_KEEP="${ASDF_DATA_DIR:-$HOME/.asdf}"
+# Captured before anything overrides HOME — the last check asserts no sandbox
+# symlink resolves back into it.
+REAL_HOME="$HOME"
 PASS=0; FAIL=0
 
 ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
@@ -285,7 +288,7 @@ check "global creds SURVIVE"            "[[ -f '$H/.claude/.credentials.json' ]]
 
 # ── 13. real ~/.claude untouched ──────────────────────────────────────────────
 echo "13. the real ~/.claude was never touched"
-check "no test symlinks into real home" "[[ -z \"\$(find '$T' -lname '/home/axius/.claude/*' 2>/dev/null)\" ]]"
+check "no test symlinks into real home" "[[ -z \"\$(find '$T' -lname '$REAL_HOME/.claude/*' 2>/dev/null)\" ]]"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
