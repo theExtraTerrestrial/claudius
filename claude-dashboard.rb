@@ -63,6 +63,18 @@ rescue StandardError
   []
 end
 
+# Read-only session pool — same shape the CLI's `sessions --json` prints, for the
+# same reason as read_profiles: one contract, so the page and the terminal never
+# disagree. The scan itself stays in the CLI; nothing about transcripts is
+# reimplemented here.
+def read_sessions(limit = 40)
+  out, _status = Open3.capture2e(SCRIPT, 'sessions', '--json', '--limit', limit.to_s)
+  parsed = JSON.parse(out)
+  parsed.is_a?(Array) ? parsed : []
+rescue StandardError
+  []
+end
+
 # Shell a mutation back into the bash CLI. Returns [ok, combined_output] with any
 # ANSI colour escapes stripped so the output is clean when surfaced in the UI.
 def run_cli(*args)
@@ -128,6 +140,18 @@ end
 
 server.mount_proc('/api/profiles') do |_req, res|
   json_response(res, read_profiles)
+end
+
+server.mount_proc('/api/sessions') do |req, res|
+  raw = query_param(req, 'limit')
+  # An explicit limit=0 asks for the whole pool and is honoured — the page only
+  # sends it when someone presses the button that says so. Anything else is
+  # clamped: a positive value to a sane ceiling, junk or absence to the default.
+  limit = if raw == '0' then 0
+          elsif raw.to_i > 0 then [raw.to_i, 500].min
+          else 40
+          end
+  json_response(res, read_sessions(limit))
 end
 
 server.mount_proc('/api/refresh') do |req, res|

@@ -39,6 +39,14 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 
 - `claudius list --json` → `{name, email, org, sub, active, u5, u7, uts, r5, r7}`.
   Tolerate null `r5`/`r7`.
+- `claudius sessions --json` →
+  `[{id, cwd, short, exists, dirkey, label, lsrc, branch, mts, size}]`, newest
+  first. `cwd`, `short`, `exists`, `label`, `lsrc` and `branch` are nullable — a
+  transcript need not carry any of them. `lsrc` says where `label` came from
+  (`title`/`slug`/`prompt`/`last`/`command`); treat an unknown value as a title.
+  `short` is `cwd` with `$HOME` written as `~`; `exists` is whether the directory
+  is still there. `--limit 0` means the whole pool and is not a mistake.
+  Never decode a path from `dirkey`; that encoding is lossy.
 - `.usage` → `u5 u7 uts r5 r7`, space-separated. Write `-` for a missing window;
   never omit a field.
 - `dashboard.html` → the sidecar substitutes `{{TOKEN}}` and `{{ROOT}}` only.

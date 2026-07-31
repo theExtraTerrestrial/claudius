@@ -2145,6 +2145,249 @@ puts JSON.generate(out)
 RB
 }
 
+# ── Sessions ──────────────────────────────────────────────────────────────────
+# The conversation pool. Because `run` symlinks ~/.claude/projects into every
+# wired profile, sessions are NOT per-account: one pool, and any profile can
+# resume any session. So this lists the pool once and leaves the choice of
+# account to whoever resumes it.
+#
+# 461MB of transcripts here and single files past 30MB, so nothing whole-reads:
+# the candidates are ranked by mtime first, then only the newest few are opened —
+# a handful of head lines for the title, one 64KB tail seek for the last state.
+# Subagent transcripts live deeper (…/<id>/subagents/agent-*.jsonl) and are not
+# resumable sessions, so only the one-level-deep UUID files count.
+sessions_json() {
+  local limit="${1:-40}"
+  ruby - "$CLAUDE_DIR/projects" "$limit" <<'RB'
+require 'json'
+root, limit = ARGV[0], ARGV[1].to_i
+UUID = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl\z/
+# Dir.home, not ENV['HOME'] directly, so a sandboxed HOME in the tests resolves
+# the same way the rest of the script does.
+HOME = Dir.home.chomp('/')
+
+files = Dir.glob(File.join(root, '*', '*.jsonl')).select { |p| File.basename(p) =~ UUID }
+# Rank before reading — mtime is a stat, the transcript body is not.
+files = files.sort_by { |p| -(File.mtime(p).to_i) }
+# limit 0 means the whole pool. It is a real request ("show me everything"), not a
+# mistake, so it is honoured rather than clamped back to the default.
+files = files.first(limit) if limit > 0
+
+# The first complete JSON objects, giving up early: cwd/branch land within a few
+# lines, a title may be on line 1, and the opening user turn is usually inside the
+# first dozen. File-history snapshots are megabytes of embedded file content and
+# never hold any of that, so they are skipped on length before being parsed.
+# Reads until it has what it came for rather than a fixed number of lines: the
+# opening user turn always precedes the first assistant reply, so an assistant
+# entry means there is nothing left to find and scanning stops there. `want` is
+# only the backstop for a transcript that never answers.
+def head_objs(path, want = 120)
+  out = []
+  File.foreach(path) do |line|
+    next if line.bytesize > 1_000_000
+    o = (JSON.parse(line) rescue nil)
+    next unless o
+    out << o
+    break if out.size >= want
+    break if o['type'] == 'assistant' && out.any? { |h| h['type'] == 'user' }
+  end
+  out
+rescue StandardError
+  []
+end
+
+# Last complete objects without reading the file: seek to the final 64KB and drop
+# the leading fragment, which is almost certainly half a line.
+def tail_objs(path)
+  size = File.size(path)
+  buf = File.open(path, 'rb') { |io| io.seek([size - 65_536, 0].max); io.read }
+  lines = buf.split("\n").reject(&:empty?)
+  lines.shift if size > 65_536 && lines.size > 1
+  lines.reverse.map { |l| JSON.parse(l) rescue nil }.compact
+rescue StandardError
+  []
+end
+
+def pick(objs, key)
+  objs.each { |o| v = o[key]; return v if v.is_a?(String) && !v.empty? }
+  nil
+end
+
+# A user turn's text, whether the content is a bare string or a block list.
+def msg_text(obj)
+  c = obj.dig('message', 'content')
+  case c
+  when String then c
+  when Array
+    c.select { |b| b.is_a?(Hash) && b['type'] == 'text' }.map { |b| b['text'] }.compact.join(' ')
+  end
+end
+
+# Machinery the user never typed: the caveat Claude Code prepends to a resumed
+# session, command stdout/stderr replayed back in, hook output, injected reminders.
+WRAPPER = /\A\s*<\/?(?:local-command-caveat|local-command-stdout|local-command-stderr|
+  system-reminder|user-prompt-submit-hook|ide[_-][a-z]+)[\s>\/]/x
+
+# The opening of the conversation, as two separate answers because they are worth
+# different amounts. Prose is what the session is *about*. A slash command is not
+# prose — it arrives wrapped in <command-name> tags — but "/resume" still says more
+# than nothing, so it comes back as a weaker second option rather than being
+# dropped. Returns [prose, command], either or both possibly nil.
+def first_prompt(objs)
+  prose = nil
+  cmd = nil
+  objs.each do |o|
+    next unless o['type'] == 'user' && o['isMeta'] != true && o.dig('message', 'role') == 'user'
+    t = msg_text(o)
+    next if t.nil? || t.strip.empty?
+    if (m = t.match(%r{<command-name>\s*([^<]{1,60}?)\s*</command-name>}))
+      unless cmd
+        args = t[%r{<command-args>\s*([^<]{0,80}?)\s*</command-args>}, 1].to_s.strip
+        cmd = args.empty? ? m[1].strip : "#{m[1].strip} #{args}"
+      end
+      next
+    end
+    next if t =~ WRAPPER
+    prose = t
+    break
+  end
+  [prose, cmd]
+end
+
+# Whatever reads best as a name, best source first. Also reports which source won,
+# so the dashboard can show a title as a name but a prompt as something quoted —
+# they are not the same kind of thing and shouldn't read alike.
+def label_of(head, tail)
+  prose, cmd = first_prompt(head)
+  raw, src = [
+    [pick(tail, 'aiTitle') || pick(head, 'aiTitle'), 'title'],
+    [pick(tail, 'slug') || pick(head, 'slug'), 'slug'],
+    [prose, 'prompt'],
+    [pick(tail, 'lastPrompt') || pick(head, 'lastPrompt'), 'last'],
+    [cmd, 'command'],
+  ].find { |v, _| v.is_a?(String) && !v.strip.empty? }
+  return [nil, nil] unless raw
+  s = raw.tr("\n\r\t", '   ').gsub(/\s+/, ' ').strip
+  s = s.tr('-', ' ') if src == 'slug' && s =~ /\A[a-z0-9-]+\z/   # slugs read better spaced
+  return [nil, nil] if s.empty?
+  [s.length > 72 ? s[0, 71] + '…' : s, src]
+end
+
+out = []
+files.each do |path|
+  head = head_objs(path)
+  next if head.empty?
+  # A subagent transcript that landed at session depth is still not resumable.
+  next if head.any? { |o| o['isSidechain'] == true }
+  tail = tail_objs(path)
+  both = tail + head
+  id = File.basename(path, '.jsonl')
+  # cwd from the transcript, never decoded from the directory name — that
+  # encoding replaces every '/' with '-' and cannot be reversed for a path
+  # that legitimately contains a dash.
+  dirkey = File.basename(File.dirname(path))
+  # Which directory to cd into is not a free choice: `--resume` resolves a session
+  # against the project directory Claude Code filed it under, which is exactly the
+  # directory this transcript sits in. A session's cwd moves while it runs, so
+  # neither the first nor the last one it mentions is reliably that directory — the
+  # first misses a worktree entered mid-session, the last catches whatever scratch
+  # subdirectory it wandered into. Both produced commands that run cleanly and find
+  # no session.
+  #
+  # So the candidates are checked against the directory name instead. Encoding a
+  # path into that name is exact (every '/' and '.' becomes '-'); only the reverse
+  # is lossy, and the reverse is never attempted here.
+  cands = (head + tail).map { |o| o['cwd'] }.compact.reject(&:empty?).uniq
+  cwd = cands.find { |c| c.gsub(%r{[/.]}, '-') == dirkey } || cands.first
+  label, lsrc = label_of(head, tail)
+  # `exists` is the difference between a command that works and one that fails on
+  # its first clause: a resume has to cd into the project, and directories get
+  # deleted, renamed and moved out from under a transcript all the time. nil when
+  # there is no cwd to check at all.
+  # `short` is the same path written the way a person writes it, and it also
+  # disambiguates the home directory itself, whose basename is a username and
+  # reads exactly like a profile name in a narrow column.
+  short = if cwd.nil? then nil
+          elsif cwd == HOME then '~'
+          elsif cwd.start_with?(HOME + '/') then '~' + cwd[HOME.length..]
+          else cwd
+          end
+  out << {
+    'id' => id,
+    'cwd' => cwd,
+    'short' => short,
+    'exists' => cwd.nil? ? nil : File.directory?(cwd),
+    'dirkey' => dirkey,
+    'label' => label,
+    'lsrc' => lsrc,
+    'branch' => pick(both, 'gitBranch'),
+    'mts' => File.mtime(path).to_i,
+    'size' => File.size(path),
+  }
+end
+puts JSON.generate(out)
+RB
+}
+
+# claudius sessions [--json] [--limit N] — the resumable pool, newest first.
+cmd_sessions() {
+  local json=false limit=40
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)  json=true; shift ;;
+      --limit) limit="${2:-40}"; shift 2 || shift ;;
+      *) echo "usage: $(basename "$0") sessions [--json] [--limit N]" >&2; return 2 ;;
+    esac
+  done
+  case "$limit" in ''|*[!0-9]*) limit=40 ;; esac
+
+  if [[ "$json" == true ]]; then
+    sessions_json "$limit"
+    return 0
+  fi
+
+  local prog rows
+  prog="$(basename "$0")"
+  # Passed as an argument, not piped: `ruby -` takes its program from stdin, so a
+  # heredoc here would sit where the piped JSON was supposed to be.
+  rows="$(sessions_json "$limit")"
+  ruby - "$prog" "$rows" <<'RB'
+require 'json'
+prog = ARGV[0]
+rows = (JSON.parse(ARGV[1].to_s) rescue [])
+if rows.empty?
+  puts 'No sessions found in ~/.claude/projects.'
+  exit 0
+end
+now = Time.now.to_i
+age = lambda do |t|
+  s = now - t
+  return "#{s}s"            if s < 60
+  return "#{s / 60}m"       if s < 3600
+  return "#{s / 3600}h"     if s < 86_400
+  "#{s / 86_400}d"
+end
+rows.each do |r|
+  # Quoted when the label is someone's words rather than a name, same as the
+  # dashboard — a first prompt shouldn't read as if Claude titled the session.
+  quoted = %w[prompt last].include?(r['lsrc'])
+  # Truncate before quoting, or the closing quote is what gets cut off.
+  shown = (r['label'] || '(nothing was said)')[0, quoted ? 34 : 36]
+  shown = %("#{shown}") if quoted
+  # A missing directory is said out loud: the resume command starts with a cd, so
+  # this row cannot be resumed as printed.
+  where = r['short'] || r['cwd'] || r['dirkey']
+  where += '  (directory is gone)' if r['exists'] == false
+  puts format("%-6s  %-36s  %s", age.call(r['mts']), shown, where)
+  weight = r['size'].to_i >= 1_048_576 ? format("  %dMB", r['size'].to_i / 1_048_576) : ''
+  puts format("        %s%s%s", r['id'], r['branch'] ? "  [#{r['branch']}]" : '', weight)
+end
+puts
+puts "resume one with:  cd <dir> && #{prog} run <profile> --resume <id>"
+puts "                  (--limit 0 lists the whole pool)"
+RB
+}
+
 cmd_list() {
   if [[ "${1:-}" == "--json" ]]; then
     list_profiles_json
@@ -2540,6 +2783,8 @@ ${C_MUTED}USAGE${C_RESET}
   $prog                      launch the interactive TUI (default)
   $prog list [--json]        list profiles + cached usage (+ active flag)
   $prog status [--json]      show the active profile's live identity + usage
+  $prog sessions [--json] [--limit N]
+                             list the shared session pool, newest first
   $prog refresh <profile>    renew token if needed & rewrite the usage cache
   $prog activate <profile>   switch the global ~/.claude to <profile>
   $prog run [profile] [args] open a session in <profile> without switching
@@ -2588,6 +2833,7 @@ main() {
   case "$sub" in
     ""|menu)   show_menu; disable_raw_mode; leave_alt_screen ;;
     list)      cmd_list "$@" ;;
+    sessions)  cmd_sessions "$@" ;;
     status)    cmd_status "$@" ;;
     refresh)   cmd_refresh "$@" ;;
     activate)  cmd_activate "$@" ;;
