@@ -60,7 +60,11 @@ process.stdin.on("end", () => {
 
     // Resolve the target profile .usage path from that config dir.
     let target = null;
-    const norm = cfg.replace(/[\/]+$/, "");
+    // Normalise before comparing: the paths come from two different sources (the
+    // env var / transcript_path vs path.join here), so a doubled or trailing
+    // slash in either would make every comparison below fail and the cache would
+    // silently never be written.
+    const norm = path.normalize(cfg).replace(/[\/]+$/, "");
     if (norm === path.join(home, ".claude")) {
       // Default session → whichever profile is currently active.
       try {
