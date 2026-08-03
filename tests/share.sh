@@ -35,6 +35,10 @@ mkhome() {
     > "$h/.claude/settings.json"
   mkdir -p "$h/.claude/backups" "$h/.claude/ide" "$h/.claude/daemon"
   : > "$h/.claude/daemon.log"; : > "$h/.claude/daemon.lock"; : > "$h/.claude/foo.lock"
+  # The CLI's OAuth refresh lock lives in the credential-storage dir. If the
+  # pool's copy were linked into a profile, an isolated run session would lock the
+  # LIVE lock file and contend with the live session over one refresh chain.
+  : > "$h/.claude/.oauth_refresh.lock"
   # global identity file
   cat > "$h/.claude.json" <<'JSON'
 {"oauthAccount":{"emailAddress":"live@example.com"},
@@ -75,7 +79,8 @@ for e in agents commands skills CLAUDE.md projects plans tasks sessions \
          shell-snapshots file-history plugins statsig history.jsonl; do
   check "linked: $e"                   "[[ -L '$P/$e' && \"\$(readlink '$P/$e')\" == '$H/.claude/$e' ]]"
 done
-for e in .credentials.json settings.json backups ide daemon daemon.log daemon.lock foo.lock; do
+for e in .credentials.json settings.json backups ide daemon daemon.log daemon.lock foo.lock \
+         .oauth_refresh.lock; do
   check "NOT linked: $e"               "[[ ! -L '$P/$e' ]]"
 done
 check "identity still a real file"     "[[ -f '$P/.claude.json' && ! -L '$P/.claude.json' ]]"
@@ -164,19 +169,19 @@ check "no .bak for a mere symlink"      "[[ ! -e '$P/agents.pre-share.bak' ]]"
 # ── 7. token prep ─────────────────────────────────────────────────────────────
 echo "7. token preparation (Linux path)"
 H="$T/h8"; mkhome "$H"; mkprofile "$H" work "work@example.com"
-out="$(inhome "$H" 'run_prepare_token work; echo "rc=$?"')"
+out="$(inhome "$H" 'keychain_available() { return 1; }; run_prepare_token work; echo "rc=$?"')"
 check "fresh token: no-op, rc=0"        '[[ "$out" == *"rc=0"* && "$out" != *"refreshing"* ]]'
 
 # expired token belonging to the live account → adopt live creds, never rotate
 mkprofile "$H" live "live@example.com" expired
-out="$(inhome "$H" 'run_prepare_token live; echo "rc=$?"')"
+out="$(inhome "$H" 'keychain_available() { return 1; }; run_prepare_token live; echo "rc=$?"')"
 check "adopts live creds, no rotation"  '[[ "$out" == *"rc=0"* && "$out" != *"refreshing"* ]]'
 check "profile now holds live token"    "grep -q '\"live\"' '$H/.claude-profiles/live/.credentials.json'"
 
 # expired token for a different account → would refresh over the network; assert
 # only that it does not adopt the live token (offline, so the refresh must fail)
 mkprofile "$H" other "other@example.com" expired
-out="$(inhome "$H" 'oauth_refresh_creds() { return 1; }; run_prepare_token other; echo "rc=$?"' 2>&1)"
+out="$(inhome "$H" 'keychain_available() { return 1; }; oauth_refresh_creds() { return 1; }; run_prepare_token other; echo "rc=$?"' 2>&1)"
 check "unrenewable token fails loudly"  '[[ "$out" == *"rc=1"* ]]'
 check "tells you how to fix it"         '[[ "$out" == *"add other"* || "$out" == *"Sign in again"* ]]'
 check "did not steal the live token"    "grep -q 'tok-other' '$H/.claude-profiles/other/.credentials.json'"
@@ -187,14 +192,14 @@ check "did not steal the live token"    "grep -q 'tok-other' '$H/.claude-profile
 printf '{"claudeAiOauth":{"accessToken":"stale-live","refreshToken":"rt","expiresAt":1}}\n' \
   > "$H/.claude/.credentials.json"
 mkprofile "$H" live2 "live@example.com" expired
-inhome "$H" 'oauth_refresh_creds() { printf "{\"claudeAiOauth\":{\"accessToken\":\"ROTATED\",\"expiresAt\":99999999999999}}\n" > "$1"; return 0; }; run_prepare_token live2' >/dev/null 2>&1
+inhome "$H" 'keychain_available() { return 1; }; oauth_refresh_creds() { printf "{\"claudeAiOauth\":{\"accessToken\":\"ROTATED\",\"expiresAt\":99999999999999}}\n" > "$1"; return 0; }; run_prepare_token live2' >/dev/null 2>&1
 check "rotated token written to profile" "grep -q ROTATED '$H/.claude-profiles/live2/.credentials.json'"
 check "live session kept in step"        "grep -q ROTATED '$H/.claude/.credentials.json'"
 # A DIFFERENT account's rotation must never overwrite the live credential.
 printf '{"claudeAiOauth":{"accessToken":"stale-live","refreshToken":"rt","expiresAt":1}}\n' \
   > "$H/.claude/.credentials.json"
 mkprofile "$H" other2 "other@example.com" expired
-inhome "$H" 'oauth_refresh_creds() { printf "{\"claudeAiOauth\":{\"accessToken\":\"OTHERTOK\",\"expiresAt\":99999999999999}}\n" > "$1"; return 0; }; run_prepare_token other2' >/dev/null 2>&1
+inhome "$H" 'keychain_available() { return 1; }; oauth_refresh_creds() { printf "{\"claudeAiOauth\":{\"accessToken\":\"OTHERTOK\",\"expiresAt\":99999999999999}}\n" > "$1"; return 0; }; run_prepare_token other2' >/dev/null 2>&1
 check "other account left live alone"   "grep -q 'stale-live' '$H/.claude/.credentials.json'"
 
 # ── 8. plan is read-only ──────────────────────────────────────────────────────
@@ -213,11 +218,19 @@ check "unknown profile rejected"        '[[ "$out" == *"does not exist"* && "$ou
 mkdir -p "$H/.claude-profiles/creds-less"
 out="$(inhome "$H" 'run_profile creds-less; echo "rc=$?"' 2>&1)"
 check "credential-less profile refused" '[[ "$out" == *"no saved credentials"* && "$out" == *"rc=1"* ]]'
-# macOS branch: profile != live account must refuse (simulate Darwin)
+# macOS branch. A profile != the live account now gets its OWN Keychain credential
+# rather than being refused (see run_profile's credential scoping, and
+# tests/run-scope.sh which owns that behaviour). What must still refuse here is the
+# case where the scope cannot be chosen safely: too old a CLI to namespace the
+# Keychain item, or an unresolvable identity. Both return before launching claude,
+# so these need no stub on PATH.
 mkprofile "$H" mac "mac@example.com"
-out="$(inhome "$H" 'keychain_available() { return 0; }; live_account_email() { printf live@example.com; }; run_profile mac; echo "rc=$?"' 2>&1)"
-check "macOS mismatch refuses"          '[[ "$out" == *"Keychain"* && "$out" == *"rc=1"* ]]'
-check "macOS refusal suggests activate" '[[ "$out" == *"activate mac"* ]]'
+out="$(inhome "$H" 'keychain_available() { return 0; }; live_account_email() { printf live@example.com; }; claude_version_at_least() { return 1; }; claude_version() { printf 2.1.100; }; run_profile mac; echo "rc=$?"' 2>&1)"
+check "macOS + old CLI refuses"         '[[ "$out" == *"Keychain"* && "$out" == *"rc=1"* ]]'
+check "old-CLI refusal offers activate" '[[ "$out" == *"activate mac"* ]]'
+out="$(inhome "$H" 'keychain_available() { return 0; }; live_account_email() { printf ""; }; run_profile mac; echo "rc=$?"' 2>&1)"
+check "unknown live account refuses"    '[[ "$out" == *"refusing to guess"* && "$out" == *"rc=1"* ]]'
+check "refusal offers activate"         '[[ "$out" == *"activate mac"* ]]'
 
 # ── 10. CLI surface ───────────────────────────────────────────────────────────
 echo "10. CLI surface"
@@ -245,10 +258,45 @@ H="$T/h14"; mkhome "$H"; mkprofile "$H" work "work@example.com"
 BIN="$T/bin"; mkdir -p "$BIN"
 cat > "$BIN/claude" <<'STUB'
 #!/usr/bin/env bash
-if [[ "${1:-}" == --version ]]; then echo "2.1.200 (Claude Code)"; exit 0; fi
-echo "STUB-CLAUDE cfg=[${CLAUDE_CONFIG_DIR:-unset}] args=[$*]"
+if [[ "${1:-}" == --version ]]; then echo "2.1.220 (Claude Code)"; exit 0; fi
+echo "STUB-CLAUDE cfg=[${CLAUDE_CONFIG_DIR:-unset}] sec=[${CLAUDE_SECURESTORAGE_CONFIG_DIR-unset}] args=[$*]"
 STUB
 chmod +x "$BIN/claude"
+
+# A file-backed stand-in for /usr/bin/security. On macOS keychain_available() is
+# genuinely true, so without this the run path would reach the REAL login Keychain —
+# both non-hermetic and forbidden. claudius invokes `security` unqualified, so a
+# PATH entry shadows it, and this section then exercises the true macOS credential
+# path (per-dir service names, seeding, write-back) against a fake store. On Linux
+# keychain_available() stays false regardless and the file path is exercised instead.
+export FAKE_KEYCHAIN="$T/fake-keychain"
+mkdir -p "$FAKE_KEYCHAIN"
+cat > "$BIN/security" <<'STUB'
+#!/usr/bin/env bash
+store="${FAKE_KEYCHAIN:?fake keychain store not set}"
+mkdir -p "$store"
+cmd="${1:-}"; shift || true
+svc=""; val=""; want_secret=false
+while (( $# )); do
+  case "$1" in
+    -s) svc="${2:-}"; shift 2 ;;
+    -a) shift 2 ;;
+    -w) if [[ "$cmd" == add-generic-password ]]; then val="${2:-}"; shift 2; else want_secret=true; shift; fi ;;
+    *)  shift ;;
+  esac
+done
+key="$(printf '%s' "$svc" | tr -c 'a-zA-Z0-9-' '_')"
+case "$cmd" in
+  find-generic-password)
+    [[ -f "$store/$key" ]] || exit 44          # errSecItemNotFound, as the real one
+    $want_secret && cat "$store/$key"
+    exit 0 ;;
+  add-generic-password)
+    printf '%s' "$val" > "$store/$key"; exit 0 ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$BIN/security"
 
 out="$(HOME="$H" ASDF_DATA_DIR="$ASDF_KEEP" PATH="$BIN:$PATH" bash "$SCRIPT" run work --model sonnet -p hi 2>&1)"
 rc=$?

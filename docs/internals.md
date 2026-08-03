@@ -151,11 +151,23 @@ Nothing covers the TUI or the dashboard. The TUI needs a pty and raw-mode input;
 the dashboard needs a browser. Both are checked by hand, which means changes to
 either deserve more scepticism, not less.
 
-macOS cannot be tested from the development environment at all. The Keychain
-refusal in `run` is reasoned from how `CLAUDE_CONFIG_DIR` works — it does not
-redirect the Keychain, so a session launched under a profile would silently use
-whichever account is globally live — but it has not been observed. Describe it as
-reasoned, not verified.
+`tests/run-scope.sh` covers `run`'s macOS credential scoping: the per-config-dir
+service name, the write-back sync, which scope `run_profile` picks, and the cases
+it refuses. Both suites stub `security` rather than reach the real login Keychain —
+`share.sh` via a file-backed stand-in on `PATH` (claudius invokes `security`
+unqualified), `run-scope.sh` by overriding the bridge functions. Anything that
+writes a real Keychain item does not belong in a test.
+
+Beware the class of bug that hid in `share.sh` for a while: on a Mac,
+`keychain_available()` is genuinely true, so tests written for the file path took
+the Keychain branch and failed for reasons unrelated to what they meant to assert.
+Tests touching credentials must state the platform they mean — stub
+`keychain_available` explicitly rather than inheriting whatever the host is.
+
+What is verified and what is not: the service-name scheme is confirmed, since the
+name claudius derives for a profile dir matches a `Claude Code-credentials-<hash>`
+item Claude Code created on its own. Two accounts running concurrently has NOT
+been observed — it needs a second account. Describe that as reasoned, not verified.
 
 ## Sharing model
 
@@ -181,3 +193,89 @@ A consequence worth knowing when working on `remove`: deleting a wired profile i
 safer than it looks. The pooled directories are symlinks, so `rm -rf` on the
 profile takes the links and leaves the pool intact. What is actually lost is the
 profile's token and identity, and the account can be re-added.
+
+## Credential scope on macOS
+
+The token is not a file here — it is a login-Keychain item — and for a long time
+that was taken to mean `run` could not work on macOS at all: `CLAUDE_CONFIG_DIR`
+does not redirect the Keychain, so a session launched under a profile would
+authenticate as whatever account was globally live. `run` refused rather than do
+that silently.
+
+That premise expired. Claude Code derives the Keychain **service name from the
+config dir** — `Claude Code-credentials-<first 8 hex of sha256(dir)>`, and the bare
+name only when no config dir is set. So the credential can be per-profile after
+all, and `keychain_service_for_dir` reproduces that scheme.
+
+`run` therefore picks a *credential scope*:
+
+- **shared** when the profile is the live account. Both sessions use the one item,
+  so an in-session refresh renews the credential instead of forking it. This is the
+  important half: OAuth refresh tokens are single-use, so a run session refreshing
+  its own private copy of the live account's chain logs the live session out. The
+  empty string (not "unset") in `CLAUDE_SECURESTORAGE_CONFIG_DIR` selects it —
+  the CLI reads unset and empty differently, and empty means "the default dir".
+- **isolated** otherwise: the profile's own item, seeded from its
+  `.credentials.json` before launch. Seeding is mandatory rather than an
+  optimisation, because the Keychain is the primary store and a stale item left by
+  an earlier session would shadow the credential just prepared.
+
+Two consequences fall out of the CLI's storage layer being a composite — Keychain
+primary, plaintext `.credentials.json` fallback:
+
+1. A successful Keychain write **deletes the plaintext copy**. So a run session
+   migrates the token out of the file claudius treats as its source of truth.
+   `sync_profile_creds_from_keychain` brings it back, which is also why the
+   isolated path does not `exec`: claudius has to outlive the session to run it.
+   `activate` and the usage refresh call it too, so a profile is never left
+   looking credential-less.
+2. The fallback means a missing namespaced item degrades to reading the profile's
+   own file rather than to reading the wrong account. That is the safety net if a
+   future release changes the hash scheme, and the reason the version guard
+   (`RUN_ISOLATION_MIN_VERSION`) is a refusal rather than a silent best-effort.
+
+### The refresh lock follows the credential
+
+The CLI serialises token refreshes with a lock at
+`<credential storage dir>/.oauth_refresh.lock` — and that directory is the one
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` resolves, not the config dir. So the single
+variable moves the credential *and* the lock together, which is what makes shared
+scope safe rather than merely convenient: a run session on the live account takes
+the same `~/.claude/.oauth_refresh.lock` a bare `claude` takes, so the two
+serialise before either refreshes the credential they share. Two processes sharing
+one credential but locking different files would both race to spend the same
+single-use refresh token.
+
+This is why the sharing denylist's `*.lock` pattern is load-bearing, not
+housekeeping. If the pool's `.oauth_refresh.lock` were symlinked into a profile, an
+isolated session would lock the LIVE lock file and contend with the live session
+over an unrelated refresh chain. `tests/share.sh` asserts it stays unlinked.
+
+When identities cannot be resolved, `run` refuses. Guessing has two failure modes —
+running the wrong account, or logging the live session out — and neither is worth
+trading for the convenience of proceeding.
+
+The rejected alternative was `CLAUDE_CODE_OAUTH_TOKEN`, which short-circuits the
+whole storage layer and is a documented env var. It hands over an access token with
+no refresh token, so the session cannot renew and dies when the token expires a few
+hours in. Fine for a `-p` one-shot, wrong for the interactive sessions `run` is for.
+
+### Which Keychain item `add` reads
+
+`cmd_add` runs the sign-in isolated — `CLAUDE_CONFIG_DIR=$dir claude auth login` —
+so on a namespacing CLI the new account's token lands in THAT dir's item while the
+shared item still holds the live account. `materialize_profile_credentials`
+therefore reads the namespaced item first and only falls back to the shared one on
+a CLI too old to namespace.
+
+Reading the shared item first is the bug this replaced, and it was invisible:
+the new profile would get a copy of the LIVE credential, `credentials_ready` would
+pass (it only checks that some `accessToken` is present, never whose), `activate`
+would succeed, and the account you actually signed into would be stranded in an
+item claudius never read. When the namespaced item cannot be read on a modern CLI,
+`add` now fails rather than falling back — a failed add is recoverable, a profile
+silently bound to the wrong account is not.
+
+The read there gets a 30s budget rather than the default 3s, because `add` is
+interactive: if macOS raises a Keychain access prompt there is a human present to
+answer it.

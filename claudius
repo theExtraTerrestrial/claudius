@@ -12,6 +12,12 @@ CLAUDE_CONFIG="${HOME}/.claude.json"
 # macOS stores the Claude Code OAuth credential in the login Keychain under this
 # service name (account = the macOS user), not in a .credentials.json file.
 KEYCHAIN_SERVICE="Claude Code-credentials"
+# Oldest CLI release in which the Keychain credential item is namespaced per config
+# dir (see keychain_service_for_dir), which is what lets `run` isolate an account on
+# macOS. 2.1.220 is the version this was read out of and reasoned about; below it,
+# `run` falls back to refusing a non-live profile rather than risking a session that
+# silently authenticates as the wrong account.
+RUN_ISOLATION_MIN_VERSION="2.1.220"
 # Claude Code's public OAuth token endpoint + client id, used to refresh a stored
 # profile's token directly (see oauth_refresh_creds). These mirror the CLI's own
 # values; if Anthropic ever rotates them a refresh simply 401s and degrades to
@@ -202,24 +208,77 @@ keychain_available() {
 
 keychain_account() { printf '%s' "${USER:-$(id -un 2>/dev/null || echo "")}"; }
 
-# Dump the live Keychain credential JSON to stdout (nonzero/empty if absent).
-read_keychain_creds() {
-  keychain_available || return 1
-  security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$(keychain_account)" -w 2>/dev/null
+# The Keychain SERVICE name Claude Code uses for a given config dir. Since 2.1.x
+# the item is namespaced per config dir: with CLAUDE_CONFIG_DIR (or
+# CLAUDE_SECURESTORAGE_CONFIG_DIR) set to a non-default dir the service becomes
+#   "Claude Code-credentials-<first 8 hex of sha256(dir)>"
+# and without it the bare "$KEYCHAIN_SERVICE". This mirrors the CLI's own service
+# name builder, so `run` can give each profile its OWN credential item instead of
+# every config dir sharing one. Empty/absent arg → the shared default item.
+#
+# This is undocumented CLI internals, not a published contract: if a future
+# release changes the scheme, the namespaced item simply won't be found and Claude
+# Code falls back to the profile's own .credentials.json, which is why
+# run_profile seeds BOTH. Nonzero (and the default name) if the hash fails.
+keychain_service_for_dir() {
+  local dir="${1:-}"
+  if [[ -z "$dir" ]]; then printf '%s' "$KEYCHAIN_SERVICE"; return 0; fi
+  local hash
+  hash="$(ruby -rdigest -e 'print Digest::SHA256.hexdigest(ARGV[0].unicode_normalize(:nfc))[0, 8]' "$dir" 2>/dev/null)" || hash=""
+  if [[ -z "$hash" ]]; then printf '%s' "$KEYCHAIN_SERVICE"; return 1; fi
+  printf '%s-%s' "$KEYCHAIN_SERVICE" "$hash"
 }
 
-# Replace the live Keychain credential with the JSON in file $1 (-U updates the
-# existing item in place). Passing -w on the command line is the only scriptable
-# form `security` offers; the value is briefly visible to `ps`, an acceptable
-# tradeoff for a local tool. Nonzero if the Keychain is unavailable or write fails.
+# Dump a Keychain credential JSON to stdout (nonzero/empty if absent). $1 is the
+# service name, defaulting to the shared live item.
+read_keychain_creds() {
+  keychain_available || return 1
+  local svc="${1:-$KEYCHAIN_SERVICE}"
+  security find-generic-password -s "$svc" -a "$(keychain_account)" -w 2>/dev/null
+}
+
+# Same, but bounded: never blocks longer than $2 tenths of a second (default 30 =
+# 3s). Reading an item claudius did not create can raise a GUI "security wants to
+# use your confidential information" prompt, which would hang a non-interactive
+# caller forever. Background callers treat failure as "no newer credential
+# available" and carry on; interactive ones (see cmd_add) pass a longer budget so
+# there is time to actually answer the prompt.
+read_keychain_creds_guarded() {
+  keychain_available || return 1
+  local svc="${1:-$KEYCHAIN_SERVICE}" limit="${2:-30}" out pid waited=0
+  out="$(mktemp "${TMPDIR:-/tmp}/claudius.kc.XXXXXX")" || return 1
+  security find-generic-password -s "$svc" -a "$(keychain_account)" -w >"$out" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && (( waited < limit )); do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$out"
+    return 1
+  fi
+  wait "$pid" 2>/dev/null || true
+  local json; json="$(cat "$out" 2>/dev/null)"
+  rm -f "$out"
+  [[ -n "$json" ]] || return 1
+  printf '%s' "$json"
+}
+
+# Replace a Keychain credential with the JSON in file $1 (-U updates the existing
+# item in place). $2 is the service name, defaulting to the shared live item.
+# Passing -w on the command line is the only scriptable form `security` offers;
+# the value is briefly visible to `ps`, an acceptable tradeoff for a local tool.
+# Nonzero if the Keychain is unavailable or write fails.
 write_keychain_creds() {
-  local src="$1" json
+  local src="$1" svc="${2:-$KEYCHAIN_SERVICE}" json
   keychain_available || return 1
   [[ -f "$src" ]] || return 1
   json="$(cat "$src" 2>/dev/null)" || return 1
   [[ -n "$json" ]] || return 1
   security add-generic-password -U \
-    -s "$KEYCHAIN_SERVICE" -a "$(keychain_account)" -w "$json" >/dev/null 2>&1
+    -s "$svc" -a "$(keychain_account)" -w "$json" >/dev/null 2>&1
 }
 
 # The email of the account currently LIVE in the shared macOS Keychain session.
@@ -250,16 +309,71 @@ profile_account_email() {
 # .credentials.json. On macOS the freshly minted token lives only in the Keychain,
 # so pull it out and write it into the profile (0600). No-op when the file already
 # exists (Linux) or the Keychain has nothing.
+#
+# WHICH Keychain item matters, and getting it wrong is silent. The login ran under
+# CLAUDE_CONFIG_DIR=$dir, so on a namespacing CLI the new account's token is in THAT
+# dir's item (keychain_service_for_dir) — the shared item still holds the LIVE
+# account. Reading the shared item first would therefore capture the wrong account
+# and hand the new profile a copy of the live credential, which `credentials_ready`
+# cannot detect because it only checks that SOME accessToken is present. Older CLIs
+# only ever wrote the one shared item, so fall back to it there and only there.
 materialize_profile_credentials() {
-  local dir="$1" creds json
+  local dir="$1" creds json svc
   creds="$dir/.credentials.json"
   [[ -f "$creds" ]] && return 0
   keychain_available || return 1
-  json="$(read_keychain_creds)" || return 1
+  svc="$(keychain_service_for_dir "$dir")"
+  # 30s budget: `add` is interactive, so a Keychain access prompt can be answered.
+  json="$(read_keychain_creds_guarded "$svc" 300 || true)"
+  if [[ -z "$json" ]] && ! claude_version_at_least "$RUN_ISOLATION_MIN_VERSION"; then
+    json="$(read_keychain_creds || true)"
+  fi
   [[ -n "$json" ]] || return 1
   printf '%s' "$json" > "$creds"
   chmod 600 "$creds" 2>/dev/null || true
   [[ -s "$creds" ]]
+}
+
+# The expiresAt (ms since epoch) of a credentials JSON file, or 0.
+creds_expires_at() {
+  [[ -f "$1" ]] || { printf '0'; return 0; }
+  ruby -rjson -e 'begin; d=JSON.parse(File.read(ARGV[0])); rescue; print "0"; exit 0; end; print(((d["claudeAiOauth"]||{})["expiresAt"]||0).to_i)' "$1" 2>/dev/null || printf '0'
+}
+
+# Pull a profile's OWN namespaced Keychain item back into its .credentials.json.
+#
+# A `run` session (see run_profile) points Claude Code at the profile's private
+# credential item, and the CLI refreshes the token in place there — the file
+# claudius treats as the source of truth goes stale, and Claude Code's composite
+# store DELETES the plaintext copy outright once it has written the Keychain
+# successfully. So after a run we adopt the Keychain copy whenever it is newer
+# (or the file is gone). Only ever writes the profile's own dir; never the live
+# item, never ~/.claude. No-op off macOS.
+sync_profile_creds_from_keychain() {
+  local name="$1"
+  local dir="$PROFILE_ROOT/$name"
+  local creds="$dir/.credentials.json"
+  keychain_available || return 1
+  [[ -d "$dir" ]] || return 1
+
+  local svc json
+  svc="$(keychain_service_for_dir "$dir")" || return 1
+  [[ "$svc" != "$KEYCHAIN_SERVICE" ]] || return 1  # refuse to read the live item
+  json="$(read_keychain_creds_guarded "$svc")" || return 1
+  [[ -n "$json" ]] || return 1
+
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/claudius.sync.XXXXXX")" || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  printf '%s' "$json" > "$tmp"
+  # Ignore anything unparseable or without a token rather than clobbering a good file.
+  local have want
+  want="$(creds_expires_at "$tmp")"
+  if [[ "$want" == "0" ]]; then rm -f "$tmp"; return 1; fi
+  have="$(creds_expires_at "$creds")"
+  if [[ -f "$creds" ]] && (( want <= have )); then rm -f "$tmp"; return 1; fi
+  mv "$tmp" "$creds" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$creds" 2>/dev/null || true
+  return 0
 }
 
 # ── Credentials / usage probing ───────────────────────────────────────────────
@@ -541,6 +655,9 @@ refresh_profile_usage() {
     else
       # A genuinely different account: safe to refresh directly (its refresh chain
       # is independent of the live session's). Only refresh when actually expired.
+      # A `run` session may already have renewed it into the profile's own Keychain
+      # item — adopt that first so we don't rotate for nothing.
+      sync_profile_creds_from_keychain "$name" || true
       if token_expired "$creds"; then
         refresh_profile_token "$name" || true
       fi
@@ -732,6 +849,15 @@ claude_version() {
   printf '%s' "$CLAUDE_VERSION"
 }
 
+# True when the installed CLI is at least version $1. Unknown version → false, so
+# callers degrade to the conservative path rather than assuming a new feature.
+claude_version_at_least() {
+  local have; have="$(claude_version)"
+  [[ -n "$have" ]] || return 1
+  ruby -rrubygems -e 'exit(Gem::Version.new(ARGV[0]) >= Gem::Version.new(ARGV[1]) ? 0 : 1)' \
+    "$have" "$1" 2>/dev/null
+}
+
 # Make a profile dir safe to use DIRECTLY as CLAUDE_CONFIG_DIR (the whole point of
 # the config-dir support). A profile born from the isolated `claude auth login`
 # gets a .claude.json WITHOUT `hasCompletedOnboarding` (that flag is only written
@@ -830,6 +956,11 @@ activate_profile() {
   if [[ "$save_current_state" == "true" && -n "$current_active" && "$current_active" != "$name" ]]; then
     save_current_profile "$current_active" >/dev/null 2>&1 || true
   fi
+
+  # A `run` session may have migrated this profile's token into its own Keychain
+  # item and taken the plaintext copy with it; recover that before deciding the
+  # profile has nothing to activate.
+  sync_profile_creds_from_keychain "$name" || true
 
   if [[ ! -f "$source_dir/.credentials.json" ]]; then
     echo "Profile '$name' has no saved credentials; cannot activate." >&2
@@ -1217,13 +1348,37 @@ global_identity_email() {
 # message) only when the token is expired and cannot be renewed.
 run_prepare_token() {
   local name="$1"
+  local scope="${2:-shared}"
   local dir="$PROFILE_ROOT/$name"
   local creds="$dir/.credentials.json"
 
-  # macOS: claude reads the live token from the shared Keychain, which the CLI
-  # keeps fresh, and run_profile has already established this profile IS the live
-  # account. The file's own freshness is irrelevant there.
-  keychain_available && return 0
+  if keychain_available; then
+    if [[ "$scope" == "shared" ]]; then
+      # This profile IS the live account and the session will read the shared
+      # Keychain item, which the CLI keeps fresh. The file's own freshness is
+      # irrelevant, and refreshing it here would rotate the live session's
+      # single-use refresh token — i.e. log it out.
+      return 0
+    fi
+    # Isolated scope: the session is seeded from this profile's OWN credential, so
+    # the file's freshness is what matters again. A previous run may have left a
+    # newer token in the profile's Keychain item; adopt that before refreshing, to
+    # avoid a rotation we don't need.
+    sync_profile_creds_from_keychain "$name" || true
+    token_expired "$creds" || return 0
+    printf '%s·%s token expired — refreshing… ' "$C_MUTED" "$C_RESET"
+    # Safe to rotate: run_profile only chooses isolated scope for a profile bound
+    # to a DIFFERENT account than the live session, so this refresh chain is not
+    # one the live session holds.
+    if oauth_refresh_creds "$creds"; then
+      printf '%sok%s\n' "$C_GREEN" "$C_RESET"
+      return 0
+    fi
+    printf '%sfailed%s\n' "$C_AMBER" "$C_RESET"
+    printf "Could not renew the token for '%s'. Sign in again: %s add %s\n" \
+      "$name" "$(basename "$0")" "$name" >&2
+    return 1
+  fi
 
   token_expired "$creds" || return 0
 
@@ -1261,9 +1416,32 @@ run_prepare_token() {
 }
 
 # Launch `claude` (plus any extra args) inside a profile's config dir, WITHOUT
-# touching the global ~/.claude session or the active-profile marker. exec's, so
-# no wrapper process is left behind and signals/exit codes/TTY behave exactly as
-# they would for a bare `claude`.
+# touching the global ~/.claude session or the active-profile marker.
+#
+# CREDENTIAL SCOPE — the whole macOS story. Claude Code namespaces its Keychain
+# credential item per config dir (keychain_service_for_dir), so a run session can
+# be pointed at either:
+#
+#   shared   — the live item. Chosen when the profile IS the live account. The
+#              session and the live session share one credential, so a refresh
+#              inside the session renews both instead of forking them. Critically,
+#              this is what stops `run <live profile>` from rotating a single-use
+#              refresh token behind the live session's back and logging it out.
+#   isolated — the profile's OWN item, seeded from its .credentials.json. Chosen
+#              for a profile bound to a different account: that account's refresh
+#              chain is independent, so the session can renew freely. This is what
+#              makes concurrent accounts work on macOS.
+#
+# CLAUDE_SECURESTORAGE_CONFIG_DIR selects between them: a path namespaces the item
+# to that dir, the EMPTY STRING forces the shared default (the CLI reads unset vs
+# empty differently — empty means "default dir", so it must be exported empty, not
+# omitted). CLAUDE_CONFIG_DIR alone would namespace it implicitly; setting both
+# keeps the choice explicit and independent of how the CLI resolves its config dir.
+#
+# When identities can't be resolved we refuse: guessing wrong either runs the wrong
+# account silently (the old bug) or logs out the live session. Off macOS none of
+# this applies — the token is a plain file in the config dir — and the session
+# exec's exactly as before.
 run_profile() {
   local name="$1"
   shift
@@ -1278,28 +1456,39 @@ run_profile() {
     return 1
   fi
 
-  # On macOS the OAuth token lives in the shared login Keychain and
-  # CLAUDE_CONFIG_DIR does NOT redirect it, so a session launched here would use
-  # whichever account is globally live — not the one asked for. Refuse rather
-  # than silently run the wrong account.
+  local scope="shared"
   if keychain_available; then
     local live prof
     live="$(live_account_email)"
     prof="$(profile_account_email "$name")"
-    if [[ -n "$live" && -n "$prof" && "$live" != "$prof" ]]; then
-      printf '%serror:%s on macOS the live token is shared via the login Keychain,\n' \
+    if [[ -z "$live" || -z "$prof" ]]; then
+      printf '%serror:%s cannot tell which account is live, so refusing to guess.\n' \
         "$C_AMBER" "$C_RESET" >&2
-      printf '  so a session here cannot use a different account.\n' >&2
-      printf '    live account: %s\n' "$live" >&2
-      printf '    requested:    %s\n' "$prof" >&2
-      printf '  Run `%s activate %s` to switch the global account instead.\n' \
+      printf '    live account: %s\n' "${live:-unknown}" >&2
+      printf '    requested:    %s\n' "${prof:-unknown (no identity saved)}" >&2
+      printf '  On macOS the credential is scoped per account; running the wrong one\n' >&2
+      printf '  would either use the wrong identity or log out your live session.\n' >&2
+      printf '  Check `claude auth status`, or run `%s activate %s` instead.\n' \
         "$(basename "$0")" "$name" >&2
       return 1
+    fi
+    if [[ "$live" != "$prof" ]]; then
+      if ! claude_version_at_least "$RUN_ISOLATION_MIN_VERSION"; then
+        printf '%serror:%s claude %s cannot scope the login Keychain per account,\n' \
+          "$C_AMBER" "$C_RESET" "$(claude_version || echo "(unknown version)")" >&2
+        printf '  so a session here would use whichever account is globally live.\n' >&2
+        printf '    live account: %s\n' "$live" >&2
+        printf '    requested:    %s\n' "$prof" >&2
+        printf '  Upgrade to %s or newer, or run `%s activate %s` instead.\n' \
+          "$RUN_ISOLATION_MIN_VERSION" "$(basename "$0")" "$name" >&2
+        return 1
+      fi
+      scope="isolated"
     fi
   fi
 
   normalize_profile_identity "$name"
-  run_prepare_token "$name" || return 1
+  run_prepare_token "$name" "$scope" || return 1
 
   local interactive=true
   { [[ -t 0 ]] && [[ -t 1 ]]; } || interactive=false
@@ -1312,6 +1501,29 @@ run_profile() {
     "$C_MUTED" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" \
     "$GLYPH_DOT" "$C_DIM" "${email:-no identity saved}" "$C_RESET"
 
+  if [[ "$scope" == "isolated" ]]; then
+    printf '%s·%s %sown credential — the live account is untouched%s\n' \
+      "$C_MUTED" "$C_RESET" "$C_DIM" "$C_RESET"
+    local svc; svc="$(keychain_service_for_dir "$dir")"
+    # Seed the profile's own Keychain item. Required, not merely an optimisation:
+    # the Keychain is the PRIMARY store and wins over the plaintext fallback, so a
+    # stale item left by an earlier session would shadow the credential we just
+    # prepared. A write failure is survivable — the CLI falls back to the file.
+    write_keychain_creds "$dir/.credentials.json" "$svc" || true
+    local rc=0
+    env CLAUDE_CONFIG_DIR="$dir" CLAUDE_SECURESTORAGE_CONFIG_DIR="$dir" claude "$@" || rc=$?
+    # Deliberately NOT exec'd: the session refreshes into its own Keychain item and
+    # the CLI's composite store deletes the plaintext copy once it does, so we have
+    # to outlive the session to bring the newer credential back.
+    sync_profile_creds_from_keychain "$name" || true
+    return $rc
+  fi
+
+  # Shared scope, and every non-macOS run: exec's, so no wrapper process is left
+  # behind and signals/exit codes/TTY behave exactly as for a bare `claude`.
+  if keychain_available; then
+    exec env CLAUDE_CONFIG_DIR="$dir" CLAUDE_SECURESTORAGE_CONFIG_DIR="" claude "$@"
+  fi
   exec env CLAUDE_CONFIG_DIR="$dir" claude "$@"
 }
 
@@ -2348,9 +2560,11 @@ ${C_MUTED}RUN vs ACTIVATE${C_RESET}
   • Run sessions SHARE your global ~/.claude: same conversation history (so
     -c/--resume see sessions from any account), same agents, commands, skills,
     prompt history and settings. Only the token + identity are per-profile.
-  • macOS: the OAuth token lives in the shared login Keychain, which
-    CLAUDE_CONFIG_DIR does not redirect — so 'run' can only open the account
-    that is currently live. Use 'activate' to switch accounts there.
+  • macOS: the OAuth token lives in the login Keychain, and claude scopes that
+    item per config dir, so 'run' gives a non-live profile its own credential
+    and several accounts can be open at once here too. Needs claude
+    $RUN_ISOLATION_MIN_VERSION or newer; below that 'run' refuses a non-live
+    profile rather than opening the wrong account, so use 'activate' instead.
 
 ${C_MUTED}NOTES${C_RESET}
   • --json output is the stable contract consumed by the dashboard.

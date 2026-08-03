@@ -8,6 +8,13 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 - Run every CLI invocation that mutates under a throwaway `HOME`:
   `HOME="$tmp" bash claudius …`. Never invoke `activate`, `refresh`, `add`,
   `remove`, `link` or `run` bare.
+- Never `source claudius` under the real `HOME` either, not even to poke at one
+  function. Sourcing runs `main` — with no args that is the TUI, which reads the
+  real Keychain and can raise an access prompt. Source it the way the tests do,
+  with a throwaway `HOME` and a `help` argument.
+- Never run `security` against the real login Keychain from a test, script or
+  experiment. Stub it: a fake `security` on `PATH` (claudius calls it unqualified),
+  or override `keychain_available` / `read_keychain_creds` / `write_keychain_creds`.
 - Copy the sandbox pattern in `tests/share.sh` (`mkhome`); do not invent another.
 - `list`, `status` and `GET /api/profiles` are read-only — those are safe bare.
 - Never write to `~/.claude`, `~/.claude.json` or `~/.claude-profiles` from a
@@ -58,11 +65,18 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 
 ## Tests
 
-- Run `bash tests/share.sh` (94 assertions, ~20s) before any change to
+- Run `bash tests/share.sh` (97 assertions, ~20s) before any change to
   `wire_profile_sharing`, `merge_profile_settings`, `sync_profile_projects_key`,
   `link` or `run`.
+- Run `bash tests/run-scope.sh` (53 assertions) before any change to `run`'s
+  credential scoping, the Keychain bridge, `run_prepare_token`, or
+  `materialize_profile_credentials`.
+- A test that touches credentials must state its platform — stub
+  `keychain_available` explicitly. On a Mac it is true by default, so a test
+  written for the file path silently takes the Keychain branch instead.
 - Verify TUI and dashboard changes by hand — there is no suite for either.
-- Do not claim macOS behaviour works. It cannot be tested here; say so.
+- Two accounts running concurrently on macOS has not been observed (it needs a
+  second account). Do not claim it works; say it is reasoned.
 
 ## Commits
 

@@ -116,11 +116,31 @@ config dir, point `CLAUDE_CONFIG_DIR` at a directory claudius doesn't manage.
 
 ### macOS
 
-The OAuth token lives in the shared login Keychain, and `CLAUDE_CONFIG_DIR` does
-**not** redirect it — so a session launched there would use whichever account is
-globally live, not the one you named. Rather than silently run the wrong account,
-`run` refuses when the profile isn't the live one and points you at `activate`.
-Concurrent accounts therefore work on Linux/WSL, not on macOS.
+The OAuth token lives in the login Keychain rather than in a file, but Claude Code
+**scopes that Keychain item per config dir** — the service name carries a hash of
+the dir (`Claude Code-credentials-<8 hex>`). So `run` can hand a profile its own
+credential, and concurrent accounts work here too, not just on Linux/WSL.
+
+Which credential a run session gets depends on the account:
+
+| the profile is… | credential | why |
+| --- | --- | --- |
+| the **live** account | the shared live item | one credential for both sessions, so a refresh renews rather than forks it — this is what stops a run session from rotating the live session's single-use refresh token and logging it out |
+| a **different** account | the profile's own item, seeded from its `.credentials.json` | that account's refresh chain is independent, so the session can renew freely |
+
+Two caveats worth knowing:
+
+- It needs **claude 2.1.220 or newer**. Below that, `run` refuses a non-live
+  profile and points you at `activate`, rather than opening the wrong account.
+- If claudius cannot tell which account is live (`claude auth status` unavailable
+  *and* no identity saved for the profile), it refuses rather than guess — the two
+  ways of guessing wrong are "wrong identity" and "logged out".
+
+Because the Keychain is the primary store and wins over the file, a run session's
+refreshed token lands in the profile's own Keychain item and Claude Code deletes
+the plaintext copy. claudius syncs it back when the session exits, and `activate`
+and the usage refresh recover it too, so the profile is never left looking
+credential-less.
 
 ## Dashboard
 
