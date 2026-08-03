@@ -75,8 +75,9 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   `keychain_available` explicitly. On a Mac it is true by default, so a test
   written for the file path silently takes the Keychain branch instead.
 - Verify TUI and dashboard changes by hand — there is no suite for either.
-- Two accounts running concurrently on macOS has not been observed (it needs a
-  second account). Do not claim it works; say it is reasoned.
+- Two accounts running concurrently on macOS is observed working on claude
+  2.1.220. Still unobserved, so describe as reasoned: the fallback for a CLI too
+  old to namespace the Keychain item, and the refusal paths.
 
 ## Commits
 

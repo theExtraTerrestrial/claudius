@@ -164,10 +164,18 @@ the Keychain branch and failed for reasons unrelated to what they meant to asser
 Tests touching credentials must state the platform they mean — stub
 `keychain_available` explicitly rather than inheriting whatever the host is.
 
-What is verified and what is not: the service-name scheme is confirmed, since the
-name claudius derives for a profile dir matches a `Claude Code-credentials-<hash>`
-item Claude Code created on its own. Two accounts running concurrently has NOT
-been observed — it needs a second account. Describe that as reasoned, not verified.
+What is verified: the service-name scheme, since the name claudius derives for a
+profile dir matches a `Claude Code-credentials-<hash>` item Claude Code created on
+its own. And, on claude 2.1.220, two accounts running concurrently — observed with
+two profiles whose `.usage` caches were written seconds apart with different
+figures, each into its own profile, while their stored credentials carried
+different expiry times. That last detail also confirms `add` captured the account
+that signed in rather than copying the live one, which is the failure it would
+otherwise show: a byte-identical credential with the same expiry.
+
+Still reasoned rather than observed: the fallback for a CLI too old to namespace,
+and the refusal paths, which are exercised through stubs rather than against a real
+old CLI.
 
 ## Sharing model
 
