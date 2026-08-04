@@ -361,6 +361,22 @@
      saturated blue is not a colour this page uses on a control. */
   .addpanel .chk input{width:13px;height:13px;accent-color:var(--action)}
 
+  /* An account whose stored credential has lapsed. Deliberately NOT in a severity
+     colour: mint/honey/rose mean usage, and rose here would read as "at the
+     limit", which is the one thing this does not mean. Muted and dashed like
+     .addcard instead — because that is what it has become, an account that is not
+     usable until it is signed in again. */
+  .expnote{display:flex;align-items:center;gap:7px;margin:0 0 10px;padding:6px 9px;
+    border:1px dashed var(--line-2);border-radius:10px;font-size:11px;color:var(--fg-3)}
+  .expnote .ms{font-size:14px;flex:none}
+  .expnote .relog{margin-left:auto;flex:none;font:inherit;font-size:11px;font-weight:600;
+    border:1px solid color-mix(in srgb,var(--action) 55%,transparent);
+    background:color-mix(in srgb,var(--action) 12%,transparent);color:var(--action);
+    border-radius:999px;padding:4px 10px;cursor:pointer;
+    display:inline-flex;align-items:center;gap:4px}
+  .expnote .relog .ms{font-size:13px}
+  .hero .expnote{font-size:12px;margin-bottom:14px;padding:8px 11px}
+
   /* ── metrics ────────────────────────────────────────────────────────── */
   .wm{display:inline-flex;align-items:baseline;font-family:var(--mono);line-height:1;flex:none}
   .wm .n{font-size:14px;font-weight:700;letter-spacing:-.05em;color:var(--fg)}
@@ -1218,6 +1234,23 @@
       ${trendHTML(name, n)}`;
   }
 
+  /* An account whose stored credential has lapsed. `refresh` renews a token from
+     the stored refresh token; once THAT has gone too there is nothing left to
+     renew and only a fresh sign-in gets the account back. It is said on the card
+     rather than only in the log because this is the state in which every other
+     button on the card fails and none of them explain why.
+
+     The button is dropped — not disabled — while a sign-in is in flight: the
+     sidecar runs one at a time, so a second one is not a thing you can ask for,
+     and a control that exists only to be refused is worse than no control. */
+  function expNote(p){
+    if (!p.expired) return "";
+    return `<div class="expnote"><span class="ms">key_off</span>signed out — its token
+      expired and cannot be renewed${ADD_LIVE.includes(ADD.state) ? ""
+        : `<button class="relog" data-relog="${esc(p.name)}"><span class="ms">login</span
+          >Sign in again</button>`}</div>`;
+  }
+
   /* The active account is the one you never have to name — `claude` alone runs
      it — so its copy lives in the menu, and the cards that do need
      `claudius run <name>` carry the button in the open. */
@@ -1230,6 +1263,8 @@
         <div class="ksec">${esc(name)}</div>
         <button data-kact="live:${esc(name)}"><span class="ms">bolt</span>
           Read live limits<span class="meta">1 call</span></button>
+        <button data-kact="relog:${esc(name)}"><span class="ms">login</span>
+          Sign in again</button>
         ${copyInMenu ? `<button data-kact="copy:${esc(name)}">
           <span class="ms">content_copy</span>Copy run command</button>` : ""}
         <div class="sep"></div>
@@ -1263,6 +1298,7 @@
             ${kebab(p.name, true)}
           </div>
         </div>
+        ${expNote(p)}
         <div class="windows">
           <div>${windowBlock(5, "h", p.u5, p.r5, W5, p.name)}</div>
           <div class="wsplit">${windowBlock(7, "d", p.u7, p.r7, W7, p.name)}</div>
@@ -1291,6 +1327,7 @@
           </div>
           ${blocked ? `<span class="sub">blocked</span>` : nextChip(p.name)}
         </div>
+        ${expNote(p)}
         ${windowBlock(5, "h", p.u5, p.r5, W5, p.name)}
         <div class="q2"><span class="wmini">7d</span>
           ${b7 == null
@@ -1342,9 +1379,15 @@
      The panel never decides that a sign-in worked. Only the sidecar does, from
      the filesystem, and only its terminal state is trusted — which is also why
      the profile list is not reloaded until then.
+
+     Signing an EXISTING account in again (`kind:"relogin"`) is the same job with
+     a different ending, so it is the same panel: same states, same code channel,
+     same cancel. Only three things differ and each is spelled out where it
+     happens — there is no name to choose, there is no account to switch to, and
+     a failure changes nothing rather than leaving nothing behind.
      ═══════════════════════════════════════════════════════════════════════ */
-  const ADD_IDLE = { state:"idle", id:null, name:"", url:null, needsCode:false,
-                     log:"", error:null, activate:false, busy:false };
+  const ADD_IDLE = { state:"idle", kind:"add", id:null, name:"", url:null,
+                     needsCode:false, log:"", error:null, activate:false, busy:false };
   let ADD = { ...ADD_IDLE };
   let addPollT = null;
   const ADD_LIVE = ["running","stopping"];
@@ -1361,10 +1404,43 @@
     return "";
   }
 
+  const addRelog = () => ADD.kind === "relogin";
+
+  /* The panel shows the end of a subprocess's output, and a blind slice lands
+     wherever the character count falls — mid-URL, so the box opens on `com)` and
+     reads as garbage before it reads as a log. Cut on a line boundary instead:
+     drop the partial first line whenever there is a whole one behind it, and keep
+     the raw slice when there isn't (one line longer than the window has no
+     boundary to cut on, and half of it beats none of it). */
+  const TAIL_MAX = 600;
+  function logTail(s){
+    if (s.length <= TAIL_MAX) return s;
+    const cut = s.slice(-TAIL_MAX), nl = cut.indexOf("\n");
+    return nl >= 0 && nl < cut.length - 1 ? cut.slice(nl + 1) : cut;
+  }
+
   function addHTML(){
     if (ADD.state === "idle")
       return `<button class="addcard" data-add="open">
         <span class="ms">add</span>add an account</button>`;
+    /* No name step for a relogin: the account already has one, and it is the one
+       thing about it that must NOT change. What is left is a confirmation, which
+       is worth showing rather than skipping — a sign-in opens a browser tab and
+       takes over the profile's credential, so it should be asked for twice. */
+    if (ADD.state === "naming" && addRelog()){
+      return `<div class="addpanel">
+        <div class="ahd"><span class="ms">login</span>sign in again
+          <button class="icobtn x" data-add="close" title="close"
+            aria-label="close"><span class="ms">close</span></button></div>
+        <div class="hint">You'll sign in with Anthropic in a new tab, for
+          <b>${esc(ADD.name)}</b>. It keeps its name, its history and its settings —
+          only the credential that expired is replaced.</div>
+        <div class="hint">Sign in with the <b>same Anthropic account</b> as before,
+          or this profile changes identity.</div>
+        <div class="row"><button class="go" data-add="start"
+          ><span class="ms">login</span>Start sign-in</button></div>
+      </div>`;
+    }
     if (ADD.state === "naming"){
       const problem = addNameProblem(ADD.name);
       const ready = ADD.name && !problem;
@@ -1384,7 +1460,8 @@
     }
     if (ADD_LIVE.includes(ADD.state)){
       return `<div class="addpanel">
-        <div class="ahd"><span class="sp"></span>signing in as ${esc(ADD.name)}</div>
+        <div class="ahd"><span class="sp"></span>${addRelog()
+          ? `signing in again as` : `signing in as`} ${esc(ADD.name)}</div>
         ${ADD.url
           ? `<a class="signin" href="${esc(ADD.url)}" target="_blank" rel="noopener"
                ><span class="ms">open_in_new</span>Open the sign-in page</a>`
@@ -1396,17 +1473,20 @@
             spellcheck="false">
           <button class="go" data-add="code"><span class="ms">send</span>Send</button>
         </div>` : ""}
-        ${ADD.log ? `<div class="tail">${esc(ADD.log.slice(-600))}</div>` : ""}
+        ${ADD.log ? `<div class="tail">${esc(logTail(ADD.log))}</div>` : ""}
         <div class="row"><button class="ghost" data-add="cancel">Cancel</button></div>
       </div>`;
     }
     /* terminal, and not done — done never renders, the new card replaces it */
     return `<div class="addpanel">
-      <div class="ahd"><span class="ms">error</span>${esc(ADD.name)} was not created
+      <div class="ahd"><span class="ms">error</span>${esc(ADD.name)} was not ${
+        addRelog() ? "signed in again" : "created"}
         <button class="icobtn x" data-add="close" title="close"
           aria-label="close"><span class="ms">close</span></button></div>
       <div class="hint bad">${esc(ADD.error || "the sign-in did not complete")}</div>
-      <div class="hint">Nothing was changed. Your other accounts are untouched.</div>
+      <div class="hint">${addRelog()
+        ? "Nothing was changed — it still has the credentials it had."
+        : "Nothing was changed. Your other accounts are untouched."}</div>
       <div class="row"><button class="go" data-add="retry"
         ><span class="ms">refresh</span>Try again</button></div>
     </div>`;
@@ -1420,7 +1500,21 @@
     const typing = document.activeElement;
     const keep = typing && (typing.id === "addName" || typing.id === "addCode")
       ? { id:typing.id, value:typing.value, at:typing.selectionStart } : null;
+    /* Same reason, for the log box: the poll repaints once a second, and an
+       innerHTML swap puts a scrolled box back at the top every time — so reading
+       anything above the last few lines was impossible while a sign-in ran. Carry
+       the position across the swap, and keep a box that was AT the bottom pinned
+       there so new output still follows on its own. A box that has just appeared
+       starts at the bottom, because the newest line is the one worth showing. */
+    const oldTail = $(".addpanel .tail");
+    const scroll = oldTail
+      ? { top:oldTail.scrollTop,
+          atEnd:oldTail.scrollHeight - oldTail.clientHeight - oldTail.scrollTop <= 4 }
+      : null;
     slot.innerHTML = addHTML();
+    const newTail = $(".addpanel .tail");
+    if (newTail)
+      newTail.scrollTop = (!scroll || scroll.atEnd) ? newTail.scrollHeight : scroll.top;
     if (keep){
       const el = $("#" + keep.id);
       if (el){
@@ -1435,23 +1529,62 @@
     clearInterval(addPollT); addPollT = null;
     ADD = { ...ADD_IDLE };
     paintAdd();
+    /* an expired card hides its button while a sign-in runs; this is where it
+       comes back */
+    if (PROFILES.length) renderStage();
+  }
+
+  /* The way in from a card. Takes over the add slot — one sign-in runs at a
+     time, so one panel drives it — and scrolls it into view, because the button
+     that opened it can be a long way up the page from the slot that answers. */
+  function reloginOpen(name){
+    if (ADD_LIVE.includes(ADD.state)) return;
+    clearInterval(addPollT); addPollT = null;
+    ADD = { ...ADD_IDLE, kind:"relogin", state:"naming", name };
+    paintAdd();
+    renderStage();
+    const slot = $("#addSlot");
+    if (slot) slot.scrollIntoView({ behavior:reduced ? "auto" : "smooth", block:"center" });
+  }
+
+  /* Every response on this channel is read through here, because not every
+     response is JSON. An endpoint the sidecar does not have answers `not found`
+     as plain text, and a bare r.json() turns that into "Unexpected token 'o'" —
+     a parser's complaint standing in for the actual problem, which is that the
+     page and the sidecar are different versions. That happens for real: the page
+     is re-read from disk on every request, so a reload picks up a new button
+     while the running sidecar is still the old process. Say that instead. */
+  async function addJSON(r, what){
+    let d = {};
+    try { d = await r.json(); } catch (_){}
+    if (r.ok && d.ok !== false) return d;
+    if (r.status === 404 && !d.error)
+      throw new Error(`this dashboard is running an older sidecar — ` +
+        `stop it and run \`claudius serve\` again to pick up ${what}`);
+    throw new Error(d.error || "HTTP " + r.status);
   }
 
   async function addStart(){
-    const name = ($("#addName") || {}).value || ADD.name;
-    ADD.activate = !!(($("#addActivate") || {}).checked);
-    if (addNameProblem(name) || !name) return;
+    const relog = addRelog();
+    const name = relog ? ADD.name : (($("#addName") || {}).value || ADD.name);
+    if (!name) return;
+    if (!relog){
+      ADD.activate = !!(($("#addActivate") || {}).checked);
+      if (addNameProblem(name)) return;
+    }
     ADD.name = name; ADD.busy = true;
     try{
-      const r = await fetch(`/api/add?profile=${encodeURIComponent(name)}${
-        ADD.activate ? "&activate=1" : ""}`,
+      const r = await fetch(relog
+        ? `/api/relogin?profile=${encodeURIComponent(name)}`
+        : `/api/add?profile=${encodeURIComponent(name)}${ADD.activate ? "&activate=1" : ""}`,
         { method:"POST", headers:{ "X-CSRF-Token":TOKEN } });
-      const d = await r.json();
-      if (!r.ok || d.ok === false) throw new Error(d.error || "HTTP " + r.status);
+      const d = await addJSON(r, relog ? "sign in again" : "add an account");
       Object.assign(ADD, { state:d.state, id:d.id, url:d.url, needsCode:d.needs_code,
                            log:d.log || "", error:null, busy:false });
-      log("sys", `signing in a new account — <b>${esc(name)}</b>`, "");
+      log("sys", relog ? `signing <b>${esc(name)}</b> in again`
+                       : `signing in a new account — <b>${esc(name)}</b>`, "");
       paintAdd();
+      renderStage();          /* the card drops its button while this runs */
       clearInterval(addPollT);
       addPollT = setInterval(addPoll, 1000);
     }catch(e){
@@ -1466,28 +1599,39 @@
   async function addPoll(){
     try{
       const r = await fetch("/api/add/status", { cache:"no-store" });
-      const d = await r.json();
-      if (!r.ok || d.ok === false) throw new Error(d.error || "HTTP " + r.status);
+      const d = await addJSON(r, "this sign-in");
       const was = ADD.state;
       Object.assign(ADD, { state:d.state, url:d.url || ADD.url,
                            needsCode:d.needs_code, log:d.log || "", error:d.error });
       if (ADD_LIVE.includes(d.state)){ paintAdd(); return; }
       clearInterval(addPollT); addPollT = null;
+      const relog = addRelog();
       if (d.state === "done"){
-        log("switch", `added <b>${esc(d.name)}</b>${
-          d.activated ? " and made it the global account" : ""}`, "");
-        toast(`${d.name} is ready`, "check");
+        if (relog){
+          log("live", `signed <b>${esc(d.name)}</b> in again`, "");
+          toast(`${d.name} is signed in again`, "check");
+        } else {
+          log("switch", `added <b>${esc(d.name)}</b>${
+            d.activated ? " and made it the global account" : ""}`, "");
+          toast(`${d.name} is ready`, "check");
+        }
         ADD = { ...ADD_IDLE };
         /* the sidecar hands back the list it read AFTER cleaning up, so this is
            the first moment the new account is safe to draw */
         if (Array.isArray(d.profiles)) PROFILES = order(d.profiles);
         await loadHistory(true);
         renderAll(); paintResets();
+        /* Its usage cache is as old as the token that expired, and the one thing
+           worth knowing now is whether the new credential actually works. One
+           call answers both. */
+        if (relog) readLive(d.name);
         return;
       }
       if (was !== d.state)
-        log("err", `<b>${esc(ADD.name)}</b> was not created — ${esc(ADD.error || d.state)}`);
+        log("err", `<b>${esc(ADD.name)}</b> was not ${relog ? "signed in again" : "created"
+          } — ${esc(ADD.error || d.state)}`);
       paintAdd();
+      if (PROFILES.length) renderStage();
     }catch(e){
       clearInterval(addPollT); addPollT = null;
       ADD.state = "failed";
@@ -1504,8 +1648,7 @@
       const r = await fetch("/api/add/code", { method:"POST",
         headers:{ "X-CSRF-Token":TOKEN, "Content-Type":"application/json" },
         body:JSON.stringify({ code }) });
-      const d = await r.json();
-      if (!r.ok || d.ok === false) throw new Error(d.error || "HTTP " + r.status);
+      await addJSON(r, "the code channel");
       if (el) el.value = "";
       /* The code is never logged — not here, not in the sidecar. Only that one
          was sent. */
@@ -1784,6 +1927,10 @@
       busy.delete(name);
       log("err", `<b>${esc(name)}</b> refresh failed — ${esc(e.message)}`);
       toast(`Refresh failed for ${name}: ${e.message}`, "error", true);
+      /* A refresh fails for good when there is nothing left to renew. Re-read the
+         list so the card can say that itself and offer the way back — otherwise
+         the only account that needs an action looks exactly like the others. */
+      try { PROFILES = await getProfiles(); } catch (_){}
       renderAll(); paintResets();
     }
   }
@@ -2311,6 +2458,7 @@
       const [kind, who] = ka.dataset.kact.split(":");
       closeMenus();
       if (kind === "live") return readLive(who);
+      if (kind === "relog") return reloginOpen(who);
       if (kind === "copy") return copyRun(who);
       if (kind === "shuffle"){
         const cur = FIELDS.indexOf(fieldFor(who));
@@ -2324,6 +2472,8 @@
     }
     const lv = e.target.closest("button[data-live]");
     if (lv) return readLive(lv.dataset.live);
+    const rl = e.target.closest("button[data-relog]");
+    if (rl) return reloginOpen(rl.dataset.relog);
     const cp = e.target.closest("button[data-copy]");
     if (cp) return copyRun(cp.dataset.copy);
     const sel = e.target.closest("button[data-sel]");
@@ -2336,9 +2486,16 @@
       if (what === "open"){ ADD.state = "naming"; paintAdd(); $("#addName").focus(); return; }
       if (what === "close" || what === "retry"){
         const retry = what === "retry" && ADD.name;
-        const name = ADD.name;
+        const name = ADD.name, kind = ADD.kind;
         addReset();
-        if (retry){ ADD.state = "naming"; ADD.name = name; paintAdd(); $("#addName").focus(); }
+        if (retry){
+          /* back to the same question that was just answered — including which
+             of the two sign-ins this was, or a retry would try to ADD a name
+             that already exists */
+          ADD.state = "naming"; ADD.name = name; ADD.kind = kind;
+          paintAdd();
+          const f = $("#addName"); if (f) f.focus();
+        }
         return;
       }
       if (what === "start")  return addStart();

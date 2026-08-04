@@ -211,7 +211,7 @@ function loadAdd(state){
   const src = [read("piece-esc.js"), "let PROFILES = [];", read("sec-add.js")].join("\n");
   const tail = `
     return {
-      fns:{ addNameOK, addNameProblem, addHTML },
+      fns:{ addNameOK, addNameProblem, addHTML, addJSON, logTail },
       set:(o) => {
         if ('PROFILES' in o) PROFILES = o.PROFILES;
         if ('ADD' in o) ADD = Object.assign({}, ADD, o.ADD);
@@ -605,9 +605,90 @@ console.log("16. the panel says only what it knows");
   ok("the name is escaped", !H().includes('onload="boom'));
 }
 
-console.log("");
-console.log(`${PASS} passed, ${FAIL} failed`);
-process.exit(FAIL === 0 ? 0 : 1);
+console.log("17. the same panel, signing an existing account back in");
+{
+  freshStorage(); stubDom();
+  const a = loadAdd({ PROFILES:[{ name:"work" }] });
+  const H = a.fns.addHTML;
+
+  a.set({ ADD:{ state:"naming", kind:"relogin", name:"work", error:null } });
+  ok("there is no name to choose", !H().includes('id="addName"'));
+  ok("and no account to switch to", !H().includes('id="addActivate"'));
+  ok("it names the account it is for", H().includes("work"));
+  /* The one that would break it: addNameProblem says "work already exists", which
+     is exactly the point of a relogin. It must not reach this panel. */
+  ok("a name in use is not an error here",
+     !H().includes("already exists") && !/data-add="start"[^>]*disabled/.test(H()));
+  ok("it says the same account must be used", H().includes("same Anthropic account"));
+
+  a.set({ ADD:{ state:"running", url:null, needsCode:false, log:"" } });
+  ok("the running panel says it is signing in again", H().includes("signing in again"));
+
+  a.set({ ADD:{ state:"failed", error:"the sign-in did not complete" } });
+  ok("a failure says what did not happen", H().includes("was not signed in again"));
+  ok("and that the account still has its old credential",
+     H().includes("still has the credentials it had"));
+  ok("with another go offered", H().includes('data-add="retry"'));
+}
+
+console.log("17b. the log tail starts on a line, not mid-word");
+{
+  freshStorage(); stubDom();
+  const a = loadAdd();
+  const T = a.fns.logTail;
+  const url = "visit: https://claude.ai/oauth/authorize?code=1&state=example.com";
+  const long = "filler line\n".repeat(80) + url + "\nPaste code here if prompted > ";
+  ok("a short log is left alone", T("one\ntwo") === "one\ntwo");
+  ok("a long one is cut to a line boundary", T(long).startsWith("filler line"));
+  ok("so the URL is either whole or absent",
+     !/^[^\n]*example\.com/.test(T(long)) || T(long).includes(url));
+  ok("and the end — the part that matters — is kept",
+     T(long).endsWith("Paste code here if prompted > "));
+  /* One line longer than the window has no boundary to cut on. Half of it beats
+     none of it, so the raw slice stands. */
+  const oneline = "x".repeat(900);
+  ok("a single overlong line still shows its tail",
+     T(oneline).length === 600 && T(oneline) === oneline.slice(-600));
+}
+
+/* The only async block in the suite — addJSON reads a response — so it takes the
+   summary with it rather than letting the tally print before its assertions run. */
+(async () => {
+  console.log("18. a response that is not JSON says what is actually wrong");
+  {
+    freshStorage(); stubDom();
+    const J = loadAdd().fns.addJSON;
+    /* WEBrick answers an unmounted path with the plain text `not found`, which is
+       what a page newer than its sidecar gets. The parser's own complaint about
+       that names a character, not the problem. */
+    const res = (status, body, isJson) => ({
+      ok:status >= 200 && status < 300, status,
+      json: async () => {
+        if (!isJson) throw new SyntaxError("Unexpected token 'o'");
+        return body;
+      },
+    });
+    const err = async (r, what) => {
+      try { await J(r, what); return "(no error thrown)"; } catch (e) { return e.message; }
+    };
+
+    const m404 = await err(res(404, "not found", false), "sign in again");
+    ok("a 404 with no JSON blames the versions, not the parser",
+       /older sidecar/.test(m404) && !/Unexpected token/.test(m404));
+    ok("and names what is missing", /sign in again/.test(m404));
+    ok("the sidecar's own words win when it has some",
+       await err(res(409, { ok:false, error:"a sign-in is already in progress" }, true))
+         === "a sign-in is already in progress");
+    ok("anything else falls back to the status",
+       await err(res(500, "boom", false)) === "HTTP 500");
+    const good = await J(res(200, { ok:true, state:"running" }, true));
+    ok("and a good response is handed straight back", good.state === "running");
+  }
+
+  console.log("");
+  console.log(`${PASS} passed, ${FAIL} failed`);
+  process.exit(FAIL === 0 ? 0 : 1);
+})();
 JS
 
 WORK="$WORK" node "$WORK/run.js"

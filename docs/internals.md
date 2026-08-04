@@ -287,3 +287,35 @@ silently bound to the wrong account is not.
 The read there gets a 30s budget rather than the default 3s, because `add` is
 interactive: if macOS raises a Keychain access prompt there is a human present to
 answer it.
+
+### Why `relogin` moves the credential aside instead of overwriting it
+
+A profile whose access token AND refresh token have both lapsed cannot be
+renewed: `refresh` has nothing left to exchange, and the only way back is a fresh
+browser sign-in. `cmd_relogin` is that sign-in, and it differs from `add` in one
+way that matters — the account already exists and must survive the attempt.
+
+The old `.credentials.json` is renamed to `.credentials.json.bak` before
+`claude auth login` runs, and put back on every path that is not a success,
+signal handlers included. Two things fall out of that, and both are the reason
+for it rather than side effects:
+
+- The login meets exactly the state a fresh `add` meets — a config dir with no
+  credentials. That is the path known to work. Leaving the expired file in place
+  would ask `claude auth login` to decide what to do about a credential that is
+  already there, and a CLI that concluded "already signed in" and returned
+  without doing anything would fail silently, which is the worst shape a failure
+  can take here.
+- The file disappearing and reappearing is a signal the dashboard sidecar can
+  watch. It already decides an `add` succeeded from the filesystem rather than by
+  scraping the child's output; a relogin gives it the same detector, so there is
+  one success rule for both commands instead of two. The cost is a single extra
+  rule in the job: a relogin does not arm the detector until the file has been
+  seen gone once, or the old file would read as a finished sign-in on the first
+  tick — and the newline the sidecar then sends to close the flow would sit in
+  the pipe until the code prompt read it as an empty answer.
+
+The cleanup is the mirror of the one `add` uses, and getting them the wrong way
+round is the expensive mistake: a failed add must leave nothing behind, a failed
+relogin must leave everything. In the sidecar that choice is made in exactly one
+place (`signin_undo`, by the job's `kind`) so no caller can pick the wrong one.

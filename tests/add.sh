@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Tests for adding an account from the browser — the sidecar's job model.
+# Tests for signing in from the browser — the sidecar's job model. Two commands
+# share it: `add` for a new account and `relogin` for an existing one whose token
+# can no longer be renewed. They differ only in how a failure is cleaned up, and
+# that difference is the one worth testing hardest: get it backwards and a
+# cancelled sign-in deletes a working account instead of putting it back.
 #
 # No real sign-in happens. The sidecar is started with --script pointing at a STUB
 # that imitates `claudius add`: it prints the same sign-in URL and the same
@@ -45,46 +49,71 @@ CODE="paste-code-must-never-be-echoed"
 #   hang      — prints the prompt and never does anything else (for the reaper)
 cat > "$T/stub" <<'STUB'
 #!/usr/bin/env bash
-# Stands in for `add` ONLY. Every other subcommand goes to the real CLI (its path
-# arrives in $REAL_CLI), so the read-only endpoints — and the profile list the page
-# reloads on success — behave exactly as they do in production, under this suite's
-# throwaway HOME. A quoted heredoc, so nothing below is expanded at write time.
-if [[ "$1" != add ]]; then exec bash "$REAL_CLI" "$@"; fi
+# Stands in for `add` and `relogin` ONLY. Every other subcommand goes to the real
+# CLI (its path arrives in $REAL_CLI), so the read-only endpoints — and the profile
+# list the page reloads on success — behave exactly as they do in production, under
+# this suite's throwaway HOME. A quoted heredoc, so nothing below is expanded at
+# write time.
+if [[ "$1" != add && "$1" != relogin ]]; then exec bash "$REAL_CLI" "$@"; fi
+verb="$1"
 name=""; activate=true
 for a in "$@"; do
   case "$a" in
-    add) ;;
+    add|relogin) ;;
     --no-activate) activate=false ;;
     *) [[ -z "$name" ]] && name="$a" ;;
   esac
 done
 dir="$HOME/.claude-profiles/$name"
-mkdir -p "$dir"
+creds="$dir/.credentials.json"
+if [[ "$verb" == relogin ]]; then
+  # The real cmd_relogin: refuse an absent profile, set the old credential aside
+  # so the login meets the same state a fresh add does, and put it back on every
+  # way out that is not a success — signals included.
+  [[ -d "$dir" ]] || { printf "Profile '%s' does not exist.\n" "$name" >&2; exit 1; }
+  restore() { if [[ -f "$creds.bak" ]]; then
+    if [[ -s "$creds" ]]; then rm -f "$creds.bak"; else mv "$creds.bak" "$creds"; fi; fi; }
+  [[ -f "$creds" ]] && mv "$creds" "$creds.bak"
+  trap 'restore; exit 1' INT TERM HUP
+else
+  restore() { :; }
+  mkdir -p "$dir"
+fi
 printf '%s\n' "$$" > "$HOME/stub-pid"
 printf 'activate=%s\n' "$activate" > "$HOME/stub-args"
 printf 'Opening browser to sign in…\n'
 printf 'If the browser did not open, visit: https://claude.example.invalid/oauth?state=abc\n'
 printf 'Paste code here if prompted > '
 writecreds() { printf '{"claudeAiOauth":{"accessToken":"%s","expiresAt":9999999999999}}\n' \
-  "$STUB_TOKEN" > "$dir/.credentials.json"; }
+  "$STUB_TOKEN" > "$creds"; }
+done_line() {
+  restore
+  if [[ "$verb" == relogin ]]; then printf '\n✓ Signed in again as %s.\n' "$name"
+  else printf '\n✓ Created profile %s.\n' "$name"; fi
+}
 case "${STUB_MODE:-code}" in
   code)
-    IFS= read -r code || exit 1
-    [[ -n "$code" ]] || exit 1
+    IFS= read -r code || { restore; exit 1; }
+    [[ -n "$code" ]] || { restore; exit 1; }
     writecreds
     IFS= read -r _ignored          # the trailing "press enter"
-    printf '\n✓ Created profile %s.\n' "$name"
+    done_line
     ;;
   callback)
     sleep 1
     writecreds
     IFS= read -r _ignored          # the trailing "press enter"
-    printf '\n✓ Created profile %s.\n' "$name"
+    done_line
     ;;
   fail)
     IFS= read -r _code
-    printf '\nClaude login did not complete; profile %s was not created.\n' "$name" >&2
-    rmdir "$dir" 2>/dev/null
+    restore
+    if [[ "$verb" == relogin ]]; then
+      printf '\nClaude login did not complete; %s still has the credentials it had.\n' "$name" >&2
+    else
+      printf '\nClaude login did not complete; profile %s was not created.\n' "$name" >&2
+      rmdir "$dir" 2>/dev/null
+    fi
     exit 1
     ;;
   hang)
@@ -278,9 +307,89 @@ check "nor does its child" \
   "! kill -0 \"\$(cat '$H/stub-child-pid')\" 2>/dev/null"
 check "and its profile dir is gone"      "[[ ! -e '$H/.claude-profiles/orphan' ]]"
 
-echo "10. the real profile root was never touched"
+# ── 10-12. signing an existing account in again ───────────────────────────────
+# `relogin` is the other half of the job model. What makes it its own set of
+# assertions is the cleanup: an add that fails must leave NOTHING, a relogin that
+# fails must leave EVERYTHING — and the account it must leave alone is a real one.
+OLD_TOKEN="the-old-credential-must-survive-a-failure"
+seed_expired() {              # an account whose stored token has lapsed
+  rm -rf "$H/.claude-profiles"; mkdir -p "$H/.claude-profiles/stale"
+  printf '{"claudeAiOauth":{"accessToken":"%s","expiresAt":1000}}\n' "$OLD_TOKEN" \
+    > "$H/.claude-profiles/stale/.credentials.json"
+  printf '{"oauthAccount":{"emailAddress":"stale@example.invalid"}}\n' \
+    > "$H/.claude-profiles/stale/.claude.json"
+}
+
+echo "10. what relogin refuses"
+seed_expired
+start_sidecar callback
+check "GET /api/relogin is not allowed"  "[[ \"\$(code GET /api/relogin)\" == 405 ]]"
+check "a POST without the CSRF token is refused" \
+  "[[ \"\$(code POST '/api/relogin?profile=stale')\" == 403 ]]"
+check "a name with a slash is refused" \
+  "[[ \"\$(code POST '/api/relogin?profile=a%2Fb' \"\$TOKEN\")\" == 400 ]]"
+check "a profile that does not exist is refused" \
+  "[[ \"\$(code POST '/api/relogin?profile=ghost' \"\$TOKEN\")\" == 404 ]]"
+check "the list says the stale one is expired" \
+  "req GET /api/profiles | grep -q '\"name\":\"stale\",[^]]*\"expired\":true'"
+
+echo "11. a relogin that works"
+out="$(body POST "/api/relogin?profile=stale" "$TOKEN")"
+check "the job starts"                   "grep -q '\"ok\":true' <<< \"\$out\""
+check "and says which kind it is"        "grep -q '\"kind\":\"relogin\"' <<< \"\$out\""
+check "an add cannot start alongside it" \
+  "[[ \"\$(code POST '/api/add?profile=other' \"\$TOKEN\")\" == 409 ]]"
+for _ in $(seq 1 60); do
+  st="$(body GET /api/add/status)"
+  grep -q '"state":"done"' <<< "$st" && break
+  sleep 0.25
+done
+check "it completes"                     "grep -q '\"state\":\"done\"' <<< \"\$st\""
+check "the credential was replaced" \
+  "! grep -qF '$OLD_TOKEN' '$H/.claude-profiles/stale/.credentials.json'"
+check "nothing is left set aside"        "[[ ! -e '$H/.claude-profiles/stale/.credentials.json.bak' ]]"
+check "the account itself survived"      "[[ -f '$H/.claude-profiles/stale/.claude.json' ]]"
+check "and the profile list comes back with it" \
+  "grep -q '\"name\":\"stale\"' <<< \"\$st\""
+check "no secret is in the status"       "! grep -qF '$SECRET_TOKEN' <<< \"\$st\""
+stop_sidecar
+
+echo "12. a relogin that does not finish leaves the account as it was"
+seed_expired
+start_sidecar fail
+body POST "/api/relogin?profile=stale" "$TOKEN" > /dev/null
+sleep 1
+body POST /api/add/code "$TOKEN" '{"code":"whatever"}' > /dev/null
+for _ in $(seq 1 40); do
+  st="$(body GET /api/add/status)"
+  grep -q '"state":"failed"' <<< "$st" && break
+  sleep 0.25
+done
+check "the job reports failure"          "grep -q '\"state\":\"failed\"' <<< \"\$st\""
+check "the profile is still there"       "[[ -d '$H/.claude-profiles/stale' ]]"
+check "with the credential it had"       "grep -qF '$OLD_TOKEN' '$H/.claude-profiles/stale/.credentials.json'"
+check "and nothing set aside"            "[[ ! -e '$H/.claude-profiles/stale/.credentials.json.bak' ]]"
+stop_sidecar
+
+seed_expired
+start_sidecar hang
+body POST "/api/relogin?profile=stale" "$TOKEN" > /dev/null
+for _ in $(seq 1 40); do
+  [[ -e "$H/.claude-profiles/stale/.credentials.json.bak" ]] && break
+  sleep 0.25
+done
+check "the old credential is set aside while it runs" \
+  "[[ -f '$H/.claude-profiles/stale/.credentials.json.bak' ]]"
+out="$(body POST /api/add/cancel "$TOKEN")"
+check "cancel is accepted"               "grep -q '\"ok\":true' <<< \"\$out\""
+check "the account is NOT deleted"       "[[ -d '$H/.claude-profiles/stale' ]]"
+check "and its credential is put back"   "grep -qF '$OLD_TOKEN' '$H/.claude-profiles/stale/.credentials.json'"
+stop_sidecar
+
+echo "13. the real profile root was never touched"
 check "no profile from this suite is in it" \
-  "[[ ! -e '$REAL_HOME/.claude-profiles/fresh' && ! -e '$REAL_HOME/.claude-profiles/doomed' ]]"
+  "[[ ! -e '$REAL_HOME/.claude-profiles/fresh' && ! -e '$REAL_HOME/.claude-profiles/doomed' \
+     && ! -e '$REAL_HOME/.claude-profiles/stale' ]]"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

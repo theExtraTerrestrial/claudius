@@ -107,7 +107,15 @@ rescue StandardError => e
   [false, e.message]
 end
 
-# ── Adding an account ─────────────────────────────────────────────────────────
+# ── Signing in: adding an account, and signing one in again ───────────────────
+# Two commands need a human in a browser, so neither can finish inside a POST:
+# `claudius add` for a new account, and `claudius relogin` for an existing one
+# whose refresh token has lapsed as well — the case where `refresh` can do
+# nothing and the terminal used to be the only way back. They are the same job
+# with two endings, so they are ONE job model here: same slot (only one sign-in
+# at a time either way), same status/code/cancel channel under /api/add/*, and
+# the job's `kind` is what decides how a failure is cleaned up.
+#
 # `claudius add` needs a human in a browser, so it cannot finish inside a POST.
 # It runs as a background job instead, with a PIPE on its stdin — verified to work:
 # `claude auth login` prints its sign-in URL to stdout and does not require a TTY.
@@ -147,7 +155,7 @@ def add_job_public(job)
   # back, it must not reach the browser.
   log = log.gsub(job[:secret], '[code]') if job[:secret] && !job[:secret].empty?
   {
-    id: job[:id], name: job[:name], state: job[:state],
+    id: job[:id], name: job[:name], state: job[:state], kind: job[:kind],
     url: log[%r{https?://\S+}],
     needs_code: log.include?('Paste code'),
     activated: job[:activate],
@@ -167,15 +175,38 @@ rescue StandardError
   nil
 end
 
-def add_start(name, activate)
-  args = ['add', name]
-  args << '--no-activate' unless activate
+# Put back a credential `claudius relogin` set aside and was killed before it
+# could restore. The CLI restores it itself on every path it controls, signals
+# included; this is the belt to that pair of braces, for the case where the KILL
+# lands before its trap runs. Never touches a file that is already there.
+def relogin_restore(name)
+  return unless valid_profile_name?(name)
+  dir = File.join(ROOT, name)
+  return unless File.directory?(dir) && File.dirname(dir) == ROOT
+  creds = File.join(dir, '.credentials.json')
+  bak = creds + '.bak'
+  File.rename(bak, creds) if File.file?(bak) && !File.size?(creds)
+rescue StandardError
+  nil
+end
+
+# Undo whatever this job did on its way to not finishing. An `add` leaves a
+# half-made profile dir, which goes; a `relogin` leaves an existing account with
+# its credential set aside, which comes back. Getting these two the wrong way
+# round would delete a working account, so the kind decides, never the caller.
+def signin_undo(job)
+  job[:kind] == 'relogin' ? relogin_restore(job[:name]) : add_discard(job[:name])
+end
+
+def add_start(name, activate, kind = 'add')
+  args = kind == 'relogin' ? ['relogin', name] : ['add', name]
+  args << '--no-activate' if kind == 'add' && !activate
   # Its own process group. `claudius add` runs `claude auth login` as a CHILD, so
   # signalling the bash pid alone would leave that child alive, still holding the
   # stdin pipe — the exact leak this job model exists to prevent.
   stdin, out, wait = Open3.popen2e(SCRIPT, *args, pgroup: true)
   job = { id: SecureRandom.hex(8), name: name, state: 'running', log: +'',
-          stdin: stdin, wait: wait, activate: activate, secret: nil,
+          stdin: stdin, wait: wait, activate: activate, secret: nil, kind: kind,
           started: Time.now, nudged: false, error: nil }
 
   # Reader: everything the CLI says, as it says it.
@@ -197,9 +228,17 @@ def add_start(name, activate)
   # half-made profile behind for the rest of the session.
   Thread.new do
     creds = File.join(ROOT, name, '.credentials.json')
+    # A relogin starts with a credentials file already there — the expired one —
+    # and `claudius relogin` moves it aside before the sign-in. So the detector
+    # is not armed until the file has been seen GONE once; otherwise the old file
+    # would read as a finished sign-in on the first tick and the newline meant
+    # for the closing prompt would go into the pipe with nothing waiting on it,
+    # to be read later as an empty answer to the code prompt.
+    armed = job[:kind] != 'relogin'
     loop do
       break unless job[:state] == 'running'
-      if !job[:nudged] && File.size?(creds)
+      armed = true if !armed && !File.exist?(creds)
+      if armed && !job[:nudged] && File.size?(creds)
         job[:nudged] = true
         # Both variants stop at "press enter" once the sign-in is through. Nobody
         # should have to press it twice, so it is answered here.
@@ -211,7 +250,7 @@ def add_start(name, activate)
       unless wait.alive?
         code = begin; wait.value.exitstatus; rescue StandardError; 1; end
         ok = code.zero? && File.size?(creds)
-        add_discard(name) unless ok
+        signin_undo(job) unless ok
         ADD_LOCK.synchronize do
           job[:error] = 'the sign-in did not complete' unless ok
           job[:state] = ok ? 'done' : 'failed'
@@ -223,7 +262,7 @@ def add_start(name, activate)
         # branch so nothing else claims the job while it is being torn down.
         ADD_LOCK.synchronize { job[:state] = 'stopping' }
         add_stop(job)
-        add_discard(name)
+        signin_undo(job)
         ADD_LOCK.synchronize do
           job[:error] = 'the sign-in was not finished in time'
           job[:state] = 'expired'
@@ -402,6 +441,37 @@ server.mount_proc('/api/add') do |req, res|
   end
 end
 
+# Sign an EXISTING account in again. The mirror image of /api/add's guards: there
+# the name must not exist, here it must — a relogin against a name with no
+# profile behind it would be an add wearing the wrong cleanup rules.
+server.mount_proc('/api/relogin') do |req, res|
+  if req.request_method != 'POST'
+    json_response(res, { ok: false, error: 'POST required' }, 405)
+  elsif !authorized?(req)
+    json_response(res, { ok: false, error: 'forbidden' }, 403)
+  else
+    name = query_param(req, 'profile')
+    exists = valid_profile_name?(name) && File.directory?(File.join(ROOT, name))
+    busy_states = ['running', 'stopping']
+    running = ADD_LOCK.synchronize { ADD_JOB[:job] && busy_states.include?(ADD_JOB[:job][:state]) }
+    if !valid_profile_name?(name)
+      json_response(res, { ok: false,
+                           error: 'a name may use letters, digits, dot, dash and underscore' }, 400)
+    elsif !exists
+      json_response(res, { ok: false, error: "#{name} does not exist" }, 404)
+    elsif running
+      json_response(res, { ok: false, error: 'a sign-in is already in progress' }, 409)
+    else
+      # No activate choice to make: `claudius relogin` re-activates the profile if
+      # it was already the global account and otherwise leaves that alone. Signing
+      # an account back in is not a request to switch to it.
+      job = add_start(name, false, 'relogin')
+      ADD_LOCK.synchronize { ADD_JOB[:job] = job }
+      json_response(res, { ok: true }.merge(add_job_public(job)))
+    end
+  end
+end
+
 server.mount_proc('/api/add/status') do |req, res|
   job = ADD_LOCK.synchronize { ADD_JOB[:job] }
   if job.nil? || (!query_param(req, 'id').empty? && query_param(req, 'id') != job[:id])
@@ -457,7 +527,7 @@ server.mount_proc('/api/add/cancel') do |req, res|
     if job[:state] == 'running'
       ADD_LOCK.synchronize { job[:state] = 'stopping' }
       add_stop(job)
-      add_discard(job[:name])
+      signin_undo(job)
       ADD_LOCK.synchronize do
         job[:error] = 'cancelled'
         job[:state] = 'cancelled'
@@ -478,7 +548,7 @@ shutdown = proc do
   if job && job[:state] == 'running'
     job[:state] = 'cancelled'
     add_stop(job)
-    add_discard(job[:name])
+    signin_undo(job)
   end
   server.shutdown
 end

@@ -2141,9 +2141,20 @@ out = []
     org = acc["organizationName"] || ""
   rescue
   end
+  # `expired` describes the credential STORED in the profile: no file, no token,
+  # or an expiry already past (same 60s skew as token_expired, so the two never
+  # disagree by a hair). It is what the page offers "sign in again" on — an
+  # expired stored credential may still be renewable from its refresh token, so
+  # this is an invitation, not a verdict, and refresh stays the first thing to
+  # try. On macOS the live account's token is in the Keychain and its file can
+  # lag behind it; that case is untested here and would read as expired early.
+  expired = true
   begin
     c = JSON.parse(File.read(File.join(dir, ".credentials.json")))
-    sub = (c["claudeAiOauth"] || {})["subscriptionType"] || ""
+    oauth = c["claudeAiOauth"] || {}
+    sub = oauth["subscriptionType"] || ""
+    exp = oauth["expiresAt"]
+    expired = !(oauth["accessToken"].to_s != "" && exp && exp / 1000.0 > Time.now.to_f + 60)
   rescue
   end
   u5 = u7 = uts = r5 = r7 = nil
@@ -2162,7 +2173,8 @@ out = []
   out << {
     "name" => name, "email" => email, "org" => org, "sub" => sub,
     "active" => (name == active),
-    "u5" => u5, "u7" => u7, "uts" => uts, "r5" => r5, "r7" => r7
+    "u5" => u5, "u7" => u7, "uts" => uts, "r5" => r5, "r7" => r7,
+    "expired" => expired
   }
 end
 puts JSON.generate(out)
@@ -2858,8 +2870,8 @@ cmd_refresh() {
     printf '%s✓%s refreshed %s%s%s  5h %s%%  7d %s%%\n' \
       "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET" "${RU5:-–}" "${RU7:-–}"
   else
-    printf '%s⚠%s could not refresh %s (sign in again to renew its token)\n' \
-      "$C_AMBER" "$C_RESET" "$name" >&2
+    printf '%s⚠%s could not refresh %s — sign in again: %s%s relogin %s%s\n' \
+      "$C_AMBER" "$C_RESET" "$name" "$C_DIM" "$(basename "$0")" "$name" "$C_RESET" >&2
     return 1
   fi
 }
@@ -3105,6 +3117,112 @@ cmd_add() {
   return 1
 }
 
+# Put a set-aside credential back, or drop it. Called on every exit from
+# cmd_relogin, including a signalled one: the file it moved aside is the only
+# thing standing between a cancelled sign-in and an account you can no longer
+# reach. A non-empty new credential wins — then the backup is just stale.
+relogin_restore() {
+  local creds="${1:-}"
+  [[ -n "$creds" && -f "$creds.bak" ]] || return 0
+  if [[ -s "$creds" ]]; then
+    rm -f "$creds.bak"
+  else
+    mv "$creds.bak" "$creds" 2>/dev/null || true
+  fi
+}
+
+# Sign in again into a profile that already exists. `refresh` renews a token from
+# the stored refresh token; when THAT has lapsed too there is nothing left to
+# renew, and a fresh browser login is the only way back. This is that command —
+# and, unlike `add`, it keeps the profile: its wiring, its card style, its usage
+# history and its name all survive, only the credential is replaced.
+#
+# The old credential is MOVED aside rather than overwritten in place, for two
+# reasons. `claude auth login` then meets exactly the state a fresh `add` meets —
+# a config dir with no credentials — which is the path known to work rather than
+# one that might decide it is already signed in and return without doing
+# anything. And the file's disappearance and reappearance is what the dashboard's
+# job model watches to decide the sign-in landed, so one detector covers both
+# commands. It is moved back on every failure path, signals included, so a
+# cancelled attempt costs nothing.
+cmd_relogin() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: $(basename "$0") relogin <profile>" >&2
+    return 2
+  fi
+  local dir="$PROFILE_ROOT/$name"
+  if [[ ! -d "$dir" ]]; then
+    echo "Profile '$name' does not exist. Create it with: $(basename "$0") add $name" >&2
+    return 1
+  fi
+
+  RELOGIN_CREDS="$dir/.credentials.json"
+  local creds="$RELOGIN_CREDS"
+  local was_active=false before_email
+  [[ "$name" == "$(get_active_profile || true)" ]] && was_active=true
+  before_email="$(profile_account_email "$name" || true)"
+
+  # A backup from an attempt that was killed before it could put things back.
+  # Restoring it here is what keeps a hard kill from costing the credential.
+  relogin_restore "$creds"
+
+  printf '\n%sSigning in again:%s %s%s%s\n\n' \
+    "$C_MUTED" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
+  echo "Complete the sign-in in your browser or terminal prompt."
+  if [[ -n "$before_email" ]]; then
+    echo "Use the same account ($before_email) — signing in as anyone else rebinds this profile."
+  fi
+  echo
+
+  if [[ -f "$creds" ]] && ! mv "$creds" "$creds.bak" 2>/dev/null; then
+    echo "Could not set '$name' credentials aside; nothing was changed." >&2
+    return 1
+  fi
+  trap 'relogin_restore "$RELOGIN_CREDS"; exit 1' INT TERM HUP
+
+  local login_ok=false
+  if CLAUDE_CONFIG_DIR="$dir" claude auth login; then
+    # See materialize_profile_credentials: on macOS the new token lands only in
+    # the Keychain, and the file we moved aside is not it.
+    materialize_profile_credentials "$dir" || true
+    credentials_ready "$creds" && login_ok=true
+  fi
+  trap - INT TERM HUP
+  relogin_restore "$creds"
+
+  if [[ "$login_ok" != true ]]; then
+    echo "Claude login did not complete; '$name' still has the credentials it had." >&2
+    return 1
+  fi
+
+  chmod 600 "$creds" 2>/dev/null || true
+  [[ -f "$dir/.claude.json" ]] && chmod 600 "$dir/.claude.json" 2>/dev/null || true
+  normalize_profile_identity "$name"
+  # 'false', not 'true': this can run from the dashboard, where there is no stdin
+  # to answer a prompt with. An already-wired profile — which any profile old
+  # enough to expire will be — has nothing to move and never asks anyway.
+  wire_profile_sharing "$name" false || true
+  merge_profile_settings "$name" || true
+  sync_profile_projects_key "$name" || true
+
+  local after_email; after_email="$(profile_account_email "$name" || true)"
+  if [[ -n "$before_email" && -n "$after_email" && "$before_email" != "$after_email" ]]; then
+    printf '%s⚠%s %s is now bound to %s (was %s).\n' \
+      "$C_AMBER" "$C_RESET" "$name" "$after_email" "$before_email" >&2
+  fi
+  # Only when it was already the global account: a sign-in should not move the
+  # global account, but leaving ~/.claude on the credential that just expired
+  # would mean the profile is fixed and the shell it is live in still is not.
+  if [[ "$was_active" == true ]]; then
+    printf '\n%s%s%s\n' "$C_RULE" "────────────────────────────────────────" "$C_RESET"
+    activate_profile "$name"
+  fi
+  printf '%s✓%s Signed in again as %s%s%s.\n' \
+    "$C_GREEN" "$C_RESET" "$C_BOLD" "$name" "$C_RESET"
+  return 0
+}
+
 # Resolve the absolute, symlink-followed path of THIS script. Portable across Linux
 # and macOS (BSD `readlink` has no -f), so `claudius` can be a symlink on PATH while
 # the dashboard sidecar is still found sitting next to the real script file.
@@ -3224,6 +3342,8 @@ ${C_MUTED}USAGE${C_RESET}
   $prog link <profile>       (re)wire a profile for shared sessions only
   $prog add [name] [--no-activate]
                              add a new profile (interactive browser login)
+  $prog relogin <profile>    sign in again into a profile whose token cannot be
+                             renewed any more (keeps the profile and its history)
   $prog remove <profile>     delete a stored profile (does not sign you out)
   $prog serve [--port N] [--open]
                              run the localhost dashboard (browser tab)
@@ -3250,7 +3370,11 @@ ${C_MUTED}NOTES${C_RESET}
     It exits 1 and says when the wait ends if every account is at a limit.
   • 'history' costs nothing: the status line records each reading it is
     handed, so the burn rate builds up for free while you work.
-  • 'add' needs an interactive terminal (browser sign-in); it is CLI-only.
+  • 'add' needs an interactive terminal (browser sign-in) — or the dashboard,
+    which drives the same sign-in from the page. So does 'relogin'.
+  • 'relogin' is what to reach for when 'refresh' says it cannot renew a token:
+    the refresh token has lapsed too, so only a fresh sign-in gets the account
+    back. Nothing else about the profile changes.
   • 'statusline' also warms the usage cache for free. Prefer your own status line?
     Keep just the cache bonus: node ~/.claudius/statusline-usage-cache.js | <yours>
 EOF
@@ -3279,6 +3403,7 @@ main() {
     run|open)  cmd_run "$@" ;;
     link)      cmd_link "$@" ;;
     add)       cmd_add "$@" ;;
+    relogin)   cmd_relogin "$@" ;;
     remove|rm|delete) cmd_remove "$@" ;;
     serve)     cmd_serve "$@" ;;
     statusline) cmd_statusline "$@" ;;

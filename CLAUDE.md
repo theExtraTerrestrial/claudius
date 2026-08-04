@@ -37,8 +37,13 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 
 ## Contracts — extend additively, never reorder or rename
 
-- `claudius list --json` → `{name, email, org, sub, active, u5, u7, uts, r5, r7}`.
-  Tolerate null `r5`/`r7`.
+- `claudius list --json` →
+  `{name, email, org, sub, active, u5, u7, uts, r5, r7, expired}`.
+  Tolerate null `r5`/`r7`. `expired` describes the credential STORED in the
+  profile — no file, no token, or an expiry already past (same 60s skew as
+  `token_expired`). It is what the page offers "sign in again" on, so it is an
+  invitation and not a verdict: an expired stored credential may still be
+  renewable from its refresh token, and `refresh` stays the first thing to try.
 - `claudius sessions --json` →
   `[{id, cwd, short, exists, dirkey, label, lsrc, branch, mts, size}]`, newest
   first. `cwd`, `short`, `exists`, `label`, `lsrc` and `branch` are nullable — a
@@ -74,6 +79,21 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   one, and a half-made profile still on disk would read as a real account.
   `stopping` is not terminal and blocks a new job. Success is decided from the
   FILESYSTEM (credentials appearing), never by scraping the child's output.
+- `POST /api/relogin` signs an EXISTING account in again — the case where
+  `refresh` has nothing left to renew. Same job model, same slot and the same
+  `/api/add/*` status/code/cancel channel as `add`; `kind` (`add`/`relogin`) is
+  what tells them apart. Its guards are the mirror of `/api/add`'s: the name must
+  exist rather than must not. Cleanup is the part to get right — an `add` that
+  fails must leave NOTHING, a `relogin` that fails must leave EVERYTHING. Never
+  reach for `add_discard` on a relogin; `signin_undo` picks by `kind`, and the
+  wrong branch deletes a working account.
+- `claudius relogin <profile>` moves the old `.credentials.json` aside before the
+  login and restores it on every failure path, signals included. Keep it that
+  way: the login then meets the same state a fresh `add` meets, and the file
+  disappearing and reappearing is the sidecar's one success detector for both
+  commands. A relogin job therefore arms that detector only after seeing the file
+  gone once — otherwise the old file reads as a finished sign-in on the first
+  tick.
 - `POST /api/add/code` is write-only. The authorization code goes to the child's
   stdin and must never reach a response, a log line or the page — it arrives in
   the request BODY, not the query string, and is scrubbed from the log tail.
@@ -137,7 +157,7 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 - Two accounts running concurrently on macOS is observed working on claude
   2.1.220. Still unobserved, so describe as reasoned: the fallback for a CLI too
   old to namespace the Keychain item, and the refusal paths.
-- Run `bash tests/dashboard.sh` (143 assertions, ~1s) after any change to
+- Run `bash tests/dashboard.sh` (162 assertions, ~1s) after any change to
   `dashboard.html`. It slices the page's `<script>` blocks by their `═══ banner ═══`
   section comments and runs the pure logic under node against stubbed storage and
   DOM. Renaming a banner breaks extraction loudly and on purpose — fix the test's
@@ -150,13 +170,14 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   Read-only: it never clicks anything that mutates. It skips when node or Chromium
   is missing, when its port is taken (probably the user's dashboard), and
   per-assertion when the pool lacks the shape being checked.
-- Run `bash tests/add.sh` (45 assertions, ~60s) after any change to the add job
-  model, its endpoints or `cmd_add`. It starts a real sidecar whose `--script` is a
-  stub standing in for `add` alone (everything else goes to the real CLI), so every
-  branch — the code channel, the newline the sidecar supplies itself, the reaper,
-  cancellation, shutdown — is driven without a real sign-in. It is also where the
-  security rules are enforced rather than merely stated: every response is checked
-  for the pasted code and for a token. Skips when the port is taken.
+- Run `bash tests/add.sh` (67 assertions, ~75s) after any change to the sign-in
+  job model, its endpoints, `cmd_add` or `cmd_relogin`. It starts a real sidecar
+  whose `--script` is a stub standing in for `add` and `relogin` alone (everything
+  else goes to the real CLI), so every branch — the code channel, the newline the
+  sidecar supplies itself, the reaper, cancellation, shutdown, and both cleanups —
+  is driven without a real sign-in. It is also where the security rules are
+  enforced rather than merely stated: every response is checked for the pasted
+  code and for a token. Skips when the port is taken.
 - Run `bash tests/history.sh` (40 assertions, ~15s) after any change to the
   `.usage.log` format, `usage_history_json` or `next_json`. Throwaway `HOME`,
   every sample written by the test, no API call — the rate segmentation and the

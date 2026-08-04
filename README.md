@@ -52,6 +52,8 @@ claudius run [profile] [args] open a claude session in <profile> WITHOUT
 claudius link <profile>       (re)wire a profile for shared sessions, no launch
 claudius add [name] [--no-activate]
                               add a new profile (interactive browser login)
+claudius relogin <profile>    sign a profile back in when its token can no
+                              longer be renewed (keeps the profile as it is)
 claudius serve [--port N] [--open]
                               run the localhost dashboard (browser tab)
 claudius statusline [--remove] enable (or remove) the shared status line
@@ -238,6 +240,15 @@ the hero slot as the switch lands.
   unlike the terminal flow it leaves your global account alone unless you tick the
   box. The code you paste is written straight to the process and is never logged,
   echoed, or included in any response.
+- **A signed-out account says so on its card, and offers the way back.** When a
+  token has expired and its refresh token has lapsed too, there is nothing left
+  for `refresh` to renew — the account is signed out, and every other button on
+  the card will fail without saying why. So the card says it, and carries a
+  **Sign in again** button that runs `claudius relogin` through the same panel
+  the sign-in above uses. The profile keeps everything it had — its name, its
+  card style, its usage history, its wiring — and only the credential is
+  replaced. A relogin you cancel or abandon puts the old credential back: the
+  opposite cleanup from an add, which removes what it made.
 - **The palette** (the `GLOBAL ·` chip) is one place to switch accounts, read all
   limits, and set preferences: reset display (**countdown** / **clock** /
   **total**), colour bias, and contrast intensity. All three are remembered in
@@ -252,7 +263,8 @@ the hero slot as the switch lands.
   header comment carries the design rules — read them before editing.
 
 The dashboard is a **monitor with a few actions**, not a full front-end: `remove`
-and `statusline` stay CLI-only for now. See `.scratch/front_end/`.
+and `statusline` stay CLI-only for now (`add` and `relogin` are not — both drive
+their browser sign-in from the page). See `.scratch/front_end/`.
 
 ## Status line
 
