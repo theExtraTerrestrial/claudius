@@ -163,15 +163,26 @@ const skip = (n, why) => { SKIP++; console.log(`  \x1b[33m—\x1b[0m ${n}  (${wh
   } else skip("search narrows the list", "no plain-text label to search for");
 
   console.log("3. keyboard");
+  // The search above left the list narrowed — on this machine's pool, to a single
+  // row, and one row is not a list you can walk: the cursor clamps at 0 and
+  // "ArrowDown moves on" asserts something no correct page could do. The keyboard
+  // is not the search's test, so it takes the whole list back first. The search is
+  // retyped further down, for the one assertion that needs something to clear.
+  await type("#sessQ", "");
+  const walkable = await js(`return document.querySelectorAll(".srow").length;`);
   await js(`document.querySelector("#sessQ").focus(); return 1;`);
   await key("ArrowDown", "ArrowDown", 40); await sleep(200);
   ok("ArrowDown picks the first row", await js(`return !!document.querySelector(".srow.cur")`));
-  await key("ArrowDown", "ArrowDown", 40); await sleep(200);
-  ok("ArrowDown moves on", await js(`
-    return [...document.querySelectorAll(".srow")].findIndex(r => r.classList.contains("cur")) === 1;`));
-  await key("ArrowUp", "ArrowUp", 38); await sleep(200);
-  ok("ArrowUp moves back", await js(`
-    return [...document.querySelectorAll(".srow")].findIndex(r => r.classList.contains("cur")) === 0;`));
+  const curAt = `[...document.querySelectorAll(".srow")].findIndex(r => r.classList.contains("cur"))`;
+  if (walkable > 1){
+    await key("ArrowDown", "ArrowDown", 40); await sleep(200);
+    ok("ArrowDown moves on", await js(`return ${curAt} === 1;`));
+    await key("ArrowUp", "ArrowUp", 38); await sleep(200);
+    ok("ArrowUp moves back", await js(`return ${curAt} === 0;`));
+  } else {
+    skip("ArrowDown moves on", "only one session in the pool");
+    skip("ArrowUp moves back", "only one session in the pool");
+  }
   await key("Enter", "Enter", 13); await sleep(400);
   ok("Enter copies a resume command", await js(`
     const t = document.querySelector("#toast").textContent || "";
@@ -179,6 +190,9 @@ const skip = (n, why) => { SKIP++; console.log(`  \x1b[33m—\x1b[0m ${n}  (${wh
   ok("the copy is recorded in the log", await js(`
     return [...document.querySelectorAll(".logrow")].some(r => /copied/.test(r.textContent));`));
 
+  // Something to clear, or the assertion below passes on an empty box having
+  // stayed empty — which is not the same statement at all.
+  await type("#sessQ", term || "zzz-no-such-session");
   await js(`document.querySelector("#sessQ").focus(); return 1;`);
   await key("Escape", "Escape", 27); await sleep(300);
   ok("Escape clears the search", await js(`
