@@ -243,10 +243,69 @@ const skip = (n, why) => { SKIP++; console.log(`  \x1b[33m—\x1b[0m ${n}  (${wh
                Math.min(...ys) >= 0 && Math.max(...ys) <= b.height;`));
     else skip("the sparkline stays inside its box", "no window has 3+ samples yet");
   } else {
+    // The row is always there — it is what keeps two cards agreeing on where
+    // everything below it sits — so what is asserted is that it says nothing,
+    // not that it is absent.
     ok("with no history, no half-answer is drawn", await js(`
-      return document.querySelectorAll(".trend").length === 0;`));
+      return [...document.querySelectorAll(".trend")]
+        .every(t => t.textContent.trim() === "" && !t.querySelector("svg"));`));
     skip("the burn rate reads correctly", "no profile has enough history yet");
     skip("the sparkline stays inside its box", "no profile has enough history yet");
+  }
+
+  // ── tooltips ───────────────────────────────────────────────────────────────
+  // Hovering is read-only, and this is the layer where the tooltip actually
+  // lives: the whole mechanism is DOM lifecycle — a title taken off its element
+  // and put back — which a unit test on pure functions cannot see at all.
+  console.log("6. tooltips");
+  const hover = (sel, ev) => `
+    const el = document.querySelector(${JSON.stringify(sel)});
+    if (!el) return "no-el";
+    el.dispatchEvent(new PointerEvent(${JSON.stringify(ev)},
+      { bubbles:true, relatedTarget:${ev === "pointerout" ? "document.body" : "null"} }));`;
+  const settle = ms => new Promise(r => setTimeout(r, ms));
+
+  if (await js(`return !!document.querySelector(".surface [data-reset]");`)){
+    await js(hover(".surface [data-reset]", "pointerover"));
+    await settle(300);
+    ok("a reset countdown says which day it means", await js(`
+      const tip = document.querySelector(".tip");
+      if (!tip || !tip.classList.contains("on")) return false;
+      /* the absolute time, and the relative one it is standing in for */
+      return /\\d/.test(tip.textContent) && !!tip.querySelector(".when");`));
+    ok("and the tooltip stays inside the viewport", await js(`
+      const b = document.querySelector(".tip").getBoundingClientRect();
+      return b.left >= 0 && b.top >= 0 && b.right <= innerWidth && b.bottom <= innerHeight;`));
+    await js(hover(".surface [data-reset]", "pointerout"));
+    await settle(120);
+    ok("and it goes when the pointer does", await js(`
+      return !document.querySelector(".tip").classList.contains("on");`));
+  } else {
+    skip("a reset countdown says which day it means", "no cached reset time in the pool");
+    skip("the tooltip stays inside the viewport", "no cached reset time in the pool");
+    skip("the tooltip goes when the pointer does", "no cached reset time in the pool");
+  }
+
+  if (await js(`return !!document.querySelector("button[data-copy]");`)){
+    const before = await js(`
+      return document.querySelector("button[data-copy]").getAttribute("title");`);
+    await js(hover("button[data-copy]", "pointerover"));
+    await settle(300);
+    ok("a title is read out in the page's own tooltip", await js(`
+      const tip = document.querySelector(".tip");
+      return tip.classList.contains("on") &&
+             tip.textContent.trim() === ${JSON.stringify(String(before || "").trim())};`));
+    ok("and the browser's own is suppressed while it shows", await js(`
+      return document.querySelector("button[data-copy]").getAttribute("title") === null;`));
+    await js(hover("button[data-copy]", "pointerout"));
+    await settle(120);
+    ok("the title comes back on the way out", await js(`
+      return document.querySelector("button[data-copy]").getAttribute("title")
+             === ${JSON.stringify(before)};`));
+  } else {
+    skip("a title is read out in the page's own tooltip", "no card with a copy button");
+    skip("the browser's own tooltip is suppressed", "no card with a copy button");
+    skip("the title comes back on the way out", "no card with a copy button");
   }
 
   const pick = await (await fetch(`http://127.0.0.1:${PORT}/api/next`)).json();

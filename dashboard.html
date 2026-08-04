@@ -807,6 +807,23 @@
   .toast .ms{font-size:17px;color:var(--action)}
   .toast.bad .ms{color:var(--crit)}
 
+  /* One tooltip for the whole page, body-level and fixed. It has to live outside
+     the cards: .surface isolates, .toolrow and the log header carry a
+     backdrop-filter and #stage a perspective, and inside any of those a popover
+     cannot escape its own siblings — the first trap listed at the top of this
+     file. Never interactive, so it takes no pointer events and steals no hover
+     from what it is describing. */
+  .tip{position:fixed;top:0;left:0;z-index:220;pointer-events:none;
+    max-width:min(74vw,320px);padding:6px 9px;border-radius:8px;
+    font-family:var(--mono);font-size:10.5px;line-height:1.5;letter-spacing:.01em;
+    color:var(--fg);background:var(--raised);
+    border:1px solid var(--line-2);box-shadow:0 10px 28px -8px rgba(0,0,0,.7);
+    white-space:pre-line;opacity:0;transition:opacity .13s ease}
+  .tip.on{opacity:1}
+  /* The relative time under the absolute one, a step down in weight: the reading
+     on the page is still the headline, this is the footnote to it. */
+  .tip .when{display:block;margin-top:2px;color:var(--fg-3)}
+
   @media (prefers-reduced-motion:reduce){
     *{animation:none !important;transition-duration:.01ms !important}
   }
@@ -1795,6 +1812,9 @@
 
   /* ═══════════ render ═════════════════════════════════════════════════ */
   function renderStage(){
+    /* The node under the pointer is about to be replaced, and a tooltip left
+       pointing at a detached one would hang there describing nothing. */
+    tipHide();
     if (!PROFILES.length){
       $("#heroSlot").innerHTML =
         `<div class="sk"><div style="color:var(--fg-2);font-size:14px">No profiles found in
@@ -1846,6 +1866,125 @@
     renderStage(); paintPal(); paintSessions(); paintAdd();
     setAmbient(activeProfile() || PROFILES[0]);
   }
+
+  /* ═══════════ tooltips ═══════════════════════════════════════════════
+     One layer, delegated, for two kinds of thing.
+
+     The times: every reset and projection on this page is relative — "3d 11h",
+     "100% at 11:10" — which is the right reading at a glance and a poor one when
+     you actually need to plan around it. "11:10" does not say which day. The
+     element carries its epoch already, for the ticker, so hovering it can answer
+     in full without anything being stored twice.
+
+     And the titles: the icon buttons all carry one, and the native tooltip is a
+     slow, unstyled box that appears somewhere near the pointer a second later.
+     Rather than convert them to a bespoke attribute — which the next button
+     added would forget — the title stays as written and is taken OFF the element
+     while it is hovered, so the browser's version never fires, then put back.
+     The markup stays the single source, and anything rendered later is covered
+     without being told about it.
+
+     The tooltip is inert: no pointer events, nothing focusable, and it never
+     reports state you cannot see elsewhere. It is a readout, not a control. */
+  const TIP_DELAY = 110;
+  /* `[data-tip-hold]` is in here because the title is taken OFF the element while
+     it is shown: without it the element stops matching its own selector the
+     moment the tooltip appears, and every further move of the pointer inside it
+     reads as a move onto nothing — which hides the tooltip and never puts the
+     title back. */
+  const TIP_SEL = "[title],[data-tip-hold],[data-reset],[data-eta]";
+  let tipEl = null, tipT = null, tipOn = null;
+
+  /* The absolute time, plus the relative one under it — whichever of the two the
+     element itself is showing, the tooltip carries the other. */
+  function tipTime(ep){
+    const d = new Date(ep * 1000);
+    const o = { weekday:"short", day:"numeric", month:"short",
+                hour:"2-digit", minute:"2-digit" };
+    if (d.getFullYear() !== new Date().getFullYear()) o.year = "numeric";
+    let full;
+    try { full = d.toLocaleString(undefined, o); } catch (e){ full = d.toString(); }
+    const rem = remaining(ep);
+    return esc(full) + (rem > 0 ? `<span class="when">in ${esc(dur(rem))}</span>` : "");
+  }
+
+  function tipHTML(el){
+    const ep = +(el.dataset.reset || el.dataset.eta || 0);
+    if (ep) return tipTime(ep);
+    const t = el.getAttribute("title") || el.dataset.tipHold || "";
+    return t ? esc(t) : "";
+  }
+
+  function tipShow(el){
+    const html = tipHTML(el);
+    if (!html) return;
+    if (!tipEl){
+      tipEl = document.createElement("div");
+      tipEl.className = "tip";
+      tipEl.setAttribute("role", "tooltip");
+      document.body.appendChild(tipEl);
+    }
+    /* Suppress the native one, or it arrives a second later on top of this. */
+    const t = el.getAttribute("title");
+    if (t !== null){ el.dataset.tipHold = t; el.removeAttribute("title"); }
+    tipOn = el;
+    tipEl.innerHTML = html;
+    tipEl.classList.add("on");
+    tipPlace(el);
+  }
+
+  /* Above the element, centred, flipped below when there is no room and clamped
+     to the viewport on x — a tooltip half off the screen is worse than none. */
+  function tipPlace(el){
+    if (!tipEl || !el) return;
+    const r = el.getBoundingClientRect(), t = tipEl.getBoundingClientRect();
+    const x = Math.max(8, Math.min(r.left + (r.width - t.width) / 2,
+                                   innerWidth - t.width - 8));
+    const above = r.top - t.height - 8;
+    const y = above < 8 ? r.bottom + 8 : above;
+    tipEl.style.transform = `translate3d(${Math.round(x)}px,${Math.round(y)}px,0)`;
+  }
+
+  function tipHide(){
+    clearTimeout(tipT); tipT = null;
+    if (tipOn){
+      /* Put the title back — unless the repaint already replaced the node, in
+         which case the new one was rendered with its own and this is a detached
+         element nobody will see again. */
+      if ("tipHold" in tipOn.dataset){
+        if (document.contains(tipOn)) tipOn.setAttribute("title", tipOn.dataset.tipHold);
+        delete tipOn.dataset.tipHold;
+      }
+      tipOn = null;
+    }
+    if (tipEl) tipEl.classList.remove("on");
+  }
+
+  const tipTarget = e => (e.target instanceof Element)
+    ? e.target.closest(TIP_SEL) : null;
+
+  function tipEnter(e){
+    const el = tipTarget(e);
+    if (!el){ if (tipOn) tipHide(); return; }
+    if (el === tipOn) return;
+    tipHide();
+    /* A delay, so sweeping the pointer across a toolbar does not strobe. */
+    tipT = setTimeout(() => tipShow(el), TIP_DELAY);
+  }
+  document.addEventListener("pointerover", tipEnter);
+  document.addEventListener("focusin", tipEnter);
+  /* Asked of the element being described, not of the event target: the pointer
+     leaves a child on its way out, and what matters is whether it has left the
+     thing the tooltip is about. */
+  document.addEventListener("pointerout", e => {
+    if (tipOn && tipOn.contains(e.target) && !tipOn.contains(e.relatedTarget)) tipHide();
+  });
+  document.addEventListener("focusout", tipHide);
+  /* Anything that moves the page under it, or takes attention away from it. */
+  addEventListener("scroll", tipHide, true);
+  addEventListener("blur", tipHide);
+  document.addEventListener("pointerdown", tipHide);
+  document.addEventListener("keydown", e => { if (e.key === "Escape") tipHide(); });
 
   /* ═══════════ events ═════════════════════════════════════════════════ */
   const DUR = { reading:1400, rippling:1450, blooming:1400 };
@@ -2255,6 +2394,7 @@
   }
 
   function paintSessions(){
+    tipHide();                 /* same reason as renderStage: the rows are replaced */
     const who = sessWho();
     $("#sessTargetWho").textContent = who || "no profile";
     $("#sessTargetBtn").hidden = PROFILES.length < 1;

@@ -154,6 +154,9 @@ function loadSessions(state){
     "let PROFILES = [];",
     "let ACTIVE = '';",
     "const activeName = () => ACTIVE;",
+    // Lives in the tooltips section: a repaint dismisses any tooltip pointing at
+    // a row it is about to replace. Nothing here tests that, so it is a no-op.
+    "const tipHide = () => {};",
     read("sec-sessions.js"),
   ].join("\n");
   const tail = `

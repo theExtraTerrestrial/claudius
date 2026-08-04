@@ -163,10 +163,13 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   DOM. Renaming a banner breaks extraction loudly and on purpose — fix the test's
   `want` list rather than letting it test nothing. node is not a claudius
   dependency: the suite skips when it is absent.
-- Run `bash tests/dashboard-live.sh` (28 assertions, ~25s) for anything touching the
-  session panel, the filters or the keyboard. It starts its own sidecar and a
-  headless Chromium and drives the real page over the DevTools protocol — the layer
-  that caught a `cd` into the wrong directory and an encoded path leaking on screen.
+- Run `bash tests/dashboard-live.sh` (34 assertions, ~25s) for anything touching
+  the session panel, the filters, the keyboard or the tooltips. It starts its own
+  sidecar and a headless Chromium and drives the real page over the DevTools
+  protocol — the layer that caught a `cd` into the wrong directory and an encoded
+  path leaking on screen. It is also the only layer that sees the tooltip at all:
+  the mechanism is DOM lifecycle (a `title` taken off its element and put back),
+  which a unit test on pure functions cannot reach.
   Read-only: it never clicks anything that mutates. It skips when node or Chromium
   is missing, when its port is taken (probably the user's dashboard), and
   per-assertion when the pool lacks the shape being checked.

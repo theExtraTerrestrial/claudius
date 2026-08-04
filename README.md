@@ -249,6 +249,12 @@ the hero slot as the switch lands.
   card style, its usage history, its wiring — and only the credential is
   replaced. A relogin you cancel or abandon puts the old credential back: the
   opposite cleanup from an add, which removes what it made.
+- **Hover a countdown to see the date.** Every time on the page is relative —
+  "resets in 3d 11h", "100% at 11:10" — which is the right reading at a glance
+  and a poor one when you are planning around it, because "11:10" does not say
+  which day. Hovering any of them gives the full date and time, with the
+  countdown underneath. The same tooltip serves every control that has something
+  to say about itself, in the page's own type rather than the browser's.
 - **The palette** (the `GLOBAL ·` chip) is one place to switch accounts, read all
   limits, and set preferences: reset display (**countdown** / **clock** /
   **total**), colour bias, and contrast intensity. All three are remembered in
