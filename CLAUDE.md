@@ -148,9 +148,12 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 - Run `bash tests/share.sh` (97 assertions, ~20s) before any change to
   `wire_profile_sharing`, `merge_profile_settings`, `sync_profile_projects_key`,
   `link` or `run`.
-- Run `bash tests/run-scope.sh` (53 assertions) before any change to `run`'s
-  credential scoping, the Keychain bridge, `run_prepare_token`, or
-  `materialize_profile_credentials`.
+- Run `bash tests/run-scope.sh` (53 assertions, 51 off macOS) before any change to
+  `run`'s credential scoping, the Keychain bridge, `run_prepare_token`, or
+  `materialize_profile_credentials`. Two file-mode assertions are BSD-only and
+  skip on Linux — use `check_macos` rather than a GNU/BSD `stat` fallback for any
+  more of them; on GNU coreutils `stat -f` reads the filesystem, not the file, and
+  the fallback quietly compares against its block report.
 - A test that touches credentials must state its platform — stub
   `keychain_available` explicitly. On a Mac it is true by default, so a test
   written for the file path silently takes the Keychain branch instead.

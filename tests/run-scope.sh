@@ -9,11 +9,22 @@ SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/claudius"
 # `ruby` here is an asdf shim that resolves installs relative to $HOME; point it at
 # the real data dir so the fake HOME does not break the interpreter itself.
 ASDF_KEEP="${ASDF_DATA_DIR:-$HOME/.asdf}"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 
 ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n' "$1"; }
+skip() { SKIP=$((SKIP+1)); printf '  \033[33m-\033[0m %s \033[2m(%s)\033[0m\n' "$1" "$2"; }
 check(){ if eval "$2"; then ok "$1"; else bad "$1  [$2]"; fi; }
+
+# A few assertions are written against BSD userland and only mean anything on a
+# Mac — they use `stat -f %Lp`, which on GNU coreutils is "stat the FILE SYSTEM"
+# and prints an unrelated block report. Run them only where they belong rather
+# than teaching every one of them to speak both dialects.
+IS_MACOS=false
+[[ "$(uname -s)" == "Darwin" ]] && IS_MACOS=true
+check_macos(){
+  if [[ "$IS_MACOS" == true ]]; then check "$1" "$2"; else skip "$1" "macOS only"; fi
+}
 
 # Same sandbox shape as tests/share.sh.
 mkhome() {
@@ -137,7 +148,7 @@ out="$(KCFILE="$T/kc-newer.json" STUBLOG="$T/log3a" inhome "$H" 'sync_profile_cr
 check "adopts a newer credential"        '[[ "$out" == *"rc=0"* ]] && grep -q "from-keychain" "'"$P"'/.credentials.json"'
 check "reads the NAMESPACED service"     'grep -q "read Claude Code-credentials-" "'"$T"'/log3a"'
 check "never reads the shared item"      '! grep -q "read DEFAULT" "'"$T"'/log3a" && ! grep -qx "read Claude Code-credentials" "'"$T"'/log3a"'
-check "file kept at 0600"                '[[ "$(stat -f %Lp "'"$P"'/.credentials.json" 2>/dev/null || stat -c %a "'"$P"'/.credentials.json")" == "600" ]]'
+check_macos "file kept at 0600"          '[[ "$(stat -f %Lp "'"$P"'/.credentials.json")" == "600" ]]'
 
 # b) older credential in the Keychain → file left alone
 mkprofile "$H" work "work@example.com"
@@ -279,7 +290,7 @@ check "captures the NEW account"          '[[ "$out" == *"rc=0"* ]] && grep -q "
 check "never the live account"            '! grep -q "LIVE-ACCOUNT" "'"$D"'/.credentials.json"'
 check "read the namespaced item"          'grep -q "read Claude Code-credentials-" "'"$T"'/log9a"'
 check "never read the shared item"        '! grep -q "read SHARED" "'"$T"'/log9a"'
-check "file at 0600"                      '[[ "$(stat -f %Lp "'"$D"'/.credentials.json" 2>/dev/null || stat -c %a "'"$D"'/.credentials.json")" == "600" ]]'
+check_macos "file at 0600"                '[[ "$(stat -f %Lp "'"$D"'/.credentials.json")" == "600" ]]'
 
 # Modern CLI, namespaced item absent → must NOT silently grab the live credential.
 rm -f "$D/.credentials.json"
@@ -304,5 +315,7 @@ check "no Keychain read at all"           '[[ ! -f "'"$T"'/log9d" ]]'
 echo "10. sandbox containment"
 check "no profile dir created in real HOME" "[[ ! -d '$HOME/.claude-profiles/other' ]]"
 
-printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+printf '\n%s passed, %s failed' "$PASS" "$FAIL"
+[[ "$SKIP" -gt 0 ]] && printf ', %s skipped (macOS only)' "$SKIP"
+printf '\n'
 [[ "$FAIL" -eq 0 ]]
