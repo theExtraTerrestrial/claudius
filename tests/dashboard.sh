@@ -520,8 +520,13 @@ console.log("13. the trend caption, and what it says when it cannot say much");
     thin:   { rate5:null, eta5:null, samples:series(2, () => 5) },
   }});
   const t = a.fns.trendHTML;
-  ok("a profile with no history gets no caption at all", t("unknown", 5) === "");
-  ok("nor does one with too little to measure or draw", t("thin", 5) === "");
+  /* Silent, but still there: the row is what keeps two cards agreeing on where
+     everything below it sits, so "nothing to say" is an empty row and never no
+     row. Checked by content, not by emptiness — the space is the point. */
+  const silent = s => /^<div class="trend hold"/.test(s) && !/%\/h|polyline|data-eta/.test(s);
+  ok("a profile with no history says nothing", silent(t("unknown", 5)));
+  ok("nor does one with too little to measure or draw", silent(t("thin", 5)));
+  ok("but both still hold the row", t("unknown", 5) !== "" && t("thin", 5) !== "");
   ok("the rate is signed", t("busy", 5).includes("+12.3%/h"));
   ok("a projected ceiling is marked for the ticker to update",
      t("busy", 5).includes(`data-eta="${now + 1800}"`));

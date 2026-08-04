@@ -157,7 +157,7 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 - Two accounts running concurrently on macOS is observed working on claude
   2.1.220. Still unobserved, so describe as reasoned: the fallback for a CLI too
   old to namespace the Keychain item, and the refusal paths.
-- Run `bash tests/dashboard.sh` (162 assertions, ~1s) after any change to
+- Run `bash tests/dashboard.sh` (163 assertions, ~1s) after any change to
   `dashboard.html`. It slices the page's `<script>` blocks by their `═══ banner ═══`
   section comments and runs the pure logic under node against stubbed storage and
   DOM. Renaming a banner breaks extraction loudly and on purpose — fix the test's

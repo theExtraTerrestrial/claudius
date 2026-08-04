@@ -404,10 +404,13 @@
   .lane .lt i{position:absolute;left:0;top:0;bottom:0;border-radius:inherit;width:0;
     transition:width .8s cubic-bezier(.2,.8,.2,1),background .6s}
   /* The burn rate, said out loud. The two lanes above already show it as the gap
-     between them; this names the gap and extrapolates it. Absent entirely until
-     there is enough history to divide by, so a fresh install never shows a
-     half-answer. */
-  .trend{display:flex;align-items:center;gap:6px;margin-top:7px;
+     between them; this names the gap and extrapolates it. Silent until there is
+     enough history to divide by, so a fresh install never shows a half-answer —
+     but it keeps its row either way. The height is the sparkline's, which is the
+     tallest thing that can land in it, so a row holding a bare rate, a full
+     caption or nothing at all all measure the same and the rows below it sit
+     where they sit on every other card. */
+  .trend{display:flex;align-items:center;gap:6px;margin-top:7px;min-height:18px;
     font-family:var(--mono);font-size:9.5px;letter-spacing:.02em;color:var(--fg-3);
     font-variant-numeric:tabular-nums}
   .hero .trend{font-size:10.5px;margin-top:10px}
@@ -1127,13 +1130,20 @@
 
   /* One function for both windows — they read identically, only the column and
      the field names differ. `k` is 5 or 7. */
+  /* An empty row rather than no row. History arrives per account — a card added
+     yesterday has a burn rate, one added an hour ago does not — so a caption that
+     simply vanishes makes two cards side by side disagree about where the 7d row
+     and the footer sit. The space is reserved instead, and the row stays the same
+     height whether it holds a sparkline, a bare rate, or nothing at all. */
+  const TREND_HOLD = `<div class="trend hold" aria-hidden="true"></div>`;
+
   function trendHTML(name, k){
     const h = histOf(name);
-    if (!h) return "";
+    if (!h) return TREND_HOLD;
     const rate = k === 5 ? h.rate5 : h.rate7;
     const eta  = k === 5 ? h.eta5  : h.eta7;
     const spark = sparkSVG(h.samples, k === 5 ? 1 : 2);
-    if (rate == null && !spark) return "";
+    if (rate == null && !spark) return TREND_HOLD;
     const bits = [];
     bits.push(rate == null
       ? `<span>no rate yet</span>`
