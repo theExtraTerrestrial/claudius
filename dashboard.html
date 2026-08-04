@@ -17,7 +17,7 @@
     ceiling. If it ever becomes decoration, cut it.
   · No lift on card hover. The card never moves; only its light responds.
 
-  Three traps that bit repeatedly while building this and will bite again:
+  Four traps that bit repeatedly while building this and will bite again:
 
   · A popover cannot escape a stacking context, and three properties here make
     one without looking like a layering decision: `isolation` on .surface,
@@ -31,6 +31,10 @@
   · Material Symbols renders through a lowercase ligature, so any inherited
     text-transform, letter-spacing or font-family turns the icon back into its
     glyph name. .ms locks those four properties for exactly that reason.
+  · An HTML comment cannot go inside the markup template literals. `<!--` is a
+    line comment in a classic script (Annex B), so it swallows the rest of the
+    line — the markup on it included — and the page renders blank with no error
+    anywhere. Comment above the function in JS instead.
 -->
 <html lang="en" data-bias="neutral" data-sevset="punchy">
 <head>
@@ -474,6 +478,12 @@
     transition:background .2s,border-color .2s,color .2s}
   .selpill:hover{color:var(--fg);border-color:var(--action)}
   .selpill[disabled]{opacity:.6;cursor:default}
+  /* Mid-switch. The spinner takes the dot's exact box so the label beside it does
+     not shift, and the pill keeps full opacity while it works — the disabled dim
+     is there to say "not pressable", and a faded spinner reads as stalled. */
+  .selpill .sp{width:11px;height:11px;border-width:1.5px}
+  .selpill.busy{color:var(--fg);border-color:var(--action)}
+  .selpill.busy[disabled]{opacity:1}
   .selpill .dot{width:11px;height:11px;border-radius:50%;border:1.5px solid var(--fg-3);
     display:grid;place-items:center;transition:border-color .2s}
   .selpill .dot::after{content:"";width:5px;height:5px;border-radius:50%;background:var(--action);
@@ -1321,6 +1331,10 @@
   }
 
   const PIPS = [20,40,60,80,100];
+  /* Footer order: Use leads the group. It is the only control there that changes
+     which account your next `claude` runs on; the two beside it are a clipboard
+     copy and a menu, so first position — the one you reach for without aiming —
+     belongs to it. */
   function cardHTML(p){
     const id = identity(p.name), e = escalate(p.u5, id);
     const blocked = p.u5 != null && p.u5 >= BLOCKED;
@@ -1348,11 +1362,11 @@
           <span class="rst" data-reset="${p.r7 || ""}">${resetText(p.r7)}</span></div>
         <div class="cfoot">
           <span class="cache ${isStale(p.uts) ? "stale" : ""}">cache ${ago(p.uts)}</span>
+          <button class="selpill" data-sel="${esc(p.name)}"><span class="dot"></span>
+            <span class="txt">Use</span></button>
           <button class="icobtn" data-copy="${esc(p.name)}"
             title="copy “claudius run ${esc(p.name)}”" aria-label="copy run command">
             <span class="ms">content_copy</span></button>
-          <button class="selpill" data-sel="${esc(p.name)}"><span class="dot"></span>
-            <span class="txt">Use</span></button>
           ${kebab(p.name, false)}
         </div>
       </div></div>`;
@@ -1952,8 +1966,17 @@
   async function activate(name){
     if (name === activeName() || busy.has("@switch")) return;
     busy.add("@switch");
+    /* The switch is a subprocess away, so the pill has to say it is working. The
+       spinner goes IN the dot's slot rather than replacing the label: same box,
+       same width, nothing under it moves — and the dot is the part that means
+       "selected", so spinning it is the honest place to put the wait. */
     const pill = $(`[data-sel="${name}"]`);
-    if (pill){ pill.disabled = true; $(".txt", pill).textContent = "…"; }
+    if (pill){
+      pill.disabled = true;
+      pill.classList.add("busy");
+      const dot = $(".dot", pill);
+      if (dot) dot.className = "sp";
+    }
     const stage = $("#stage");
     const box = el => el.getBoundingClientRect();
     const before = new Map($$("[data-name]", stage).map(el => [el.dataset.name, box(el)]));
