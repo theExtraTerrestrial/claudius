@@ -1728,14 +1728,29 @@ render_menu() {
 # Read one key (or a full arrow-key escape sequence) into the variable NAMED by $1.
 # Uses `printf -v` rather than a bash-4.3 `local -n` nameref so it runs on bash 3.2
 # (macOS) too; dynamic scoping means the caller's local is visible to set here.
+#
+# Optional $2: an INTEGER idle timeout in seconds (bash 3.2 has no fractional
+# one). When it runs out with no key pressed, the variable is emptied and the
+# return is 2 — distinct from 1, which is EOF and means the terminal is gone.
 read_key() {
   local __out="$1"
+  local idle="${2:-}"
   local char
   local seq1
   local seq2
   local nl=$'\n'
 
-  if ! IFS= read -r -s -n 1 char; then
+  if [[ -n "$idle" ]]; then
+    local rc=0
+    IFS= read -r -s -n 1 -t "$idle" char || rc=$?
+    if (( rc > 128 )); then
+      printf -v "$__out" '%s' ""
+      return 2
+    elif (( rc != 0 )); then
+      printf -v "$__out" '%s' ""
+      return 1
+    fi
+  elif ! IFS= read -r -s -n 1 char; then
     printf -v "$__out" '%s' ""
     return 1
   fi
@@ -2663,6 +2678,707 @@ puts "                  (--limit 0 lists the whole pool)"
 RB
 }
 
+# ── Agents ────────────────────────────────────────────────────────────────────
+# Claude Code's own background agents (`claude --bg`, `claude agents`), made
+# account-aware. Claude Code already keeps the registry — `sessions/` and `jobs/`
+# in the pool, which `run` links into every profile, so ONE listing shows the
+# agents of every account. What it does not show is which account an agent runs
+# under, and that is not cosmetic: each config dir runs its own supervisor, with
+# its own sockets, so attaching, stopping or reading a background agent has to go
+# through the config dir that owns it. That mapping is the whole job here; nothing
+# is recorded by claudius, everything is read back from Claude Code's own files.
+#
+# Ownership, most authoritative first:
+#   1. a LIVE supervisor's roster (<cfg>/daemon/roster.json) listing the agent —
+#      that supervisor is the one holding it right now;
+#   2. the job's own record (jobs/<id>/state.json → providerEnv.CLAUDE_CONFIG_DIR),
+#      written when it was dispatched; absent means it was dispatched from ~/.claude;
+#   3. the process environment, for interactive sessions, which have no job record;
+#   4. a dead supervisor's roster — stale, but still names who last held it.
+# Nothing found means the global ~/.claude, i.e. whichever account is live.
+#
+# Kept out of `next`'s way on purpose: this only lists and dispatches. Which
+# account to dispatch on is `next_json`'s ranking, unchanged.
+AG_US=$'\x1f'                      # field separator of the tsv rows (see agents_data)
+AGENTS_FINISHED_HIDE_AFTER=86400  # finished agents older than this are hidden unless --all
+
+# agents_data <json|tsv> <all:true|false>
+# json: the `agents --json` contract. tsv: one row per agent, fields separated by
+# \x1f (a non-whitespace IFS, so bash `read` keeps empty fields), in the order
+# read by agents_load.
+agents_data() {
+  local mode="${1:-json}" all="${2:-false}" raw
+  raw="$(claude agents --json --all 2>/dev/null)" || raw='[]'
+  [[ -n "$raw" ]] || raw='[]'
+  ruby - "$PROFILE_ROOT" "$CLAUDE_DIR" "$raw" "$mode" "$all" "$AGENTS_FINISHED_HIDE_AFTER" <<'RB'
+require 'json'
+require 'time'
+root, cdir, raw, mode, all, hide_after = ARGV
+all = all == 'true'
+hide_after = hide_after.to_i
+HOME = Dir.home.chomp('/')
+now = Time.now.to_i
+
+real = lambda { |p| (File.realpath(p) rescue File.expand_path(p)) }
+alive = lambda do |pid|
+  next false unless pid.to_i > 0
+  begin
+    Process.kill(0, pid.to_i)
+    true
+  rescue Errno::EPERM
+    true
+  rescue StandardError
+    false
+  end
+end
+groot = real.call(cdir)
+proot = real.call(root)
+
+rows = (JSON.parse(raw) rescue [])
+rows = [] unless rows.is_a?(Array)
+
+# Rosters, split by whether their supervisor still runs.
+live_roster = {}
+dead_roster = {}
+([cdir] + Dir.glob(File.join(root, '*')).select { |d| File.directory?(d) }).each do |dir|
+  r = (JSON.parse(File.read(File.join(dir, 'daemon', 'roster.json'))) rescue nil)
+  next unless r.is_a?(Hash) && r['workers'].is_a?(Hash)
+  into = alive.call(r['supervisorPid']) ? live_roster : dead_roster
+  r['workers'].each_key { |k| into[k] ||= dir }
+end
+
+proc_cfg = lambda do |pid|
+  next nil unless pid.to_i > 0
+  env = (File.binread("/proc/#{pid.to_i}/environ").split("\0") rescue nil)
+  if env
+    e = env.find { |x| x.start_with?('CLAUDE_CONFIG_DIR=') }
+    next e && e.split('=', 2)[1]
+  end
+  # BSD/macOS: no /proc. `ps eww` appends the environment to the command line for
+  # the user's own processes. Reasoned, not observed here.
+  out = (IO.popen(['ps', 'eww', '-o', 'command=', '-p', pid.to_i.to_s], err: File::NULL, &:read) rescue '')
+  out.to_s[/(?:\A|\s)CLAUDE_CONFIG_DIR=(\S+)/, 1]
+end
+
+# A config dir → [profile, global?]. A dir that is neither ~/.claude nor under the
+# profile root is reported as-is with no profile: someone set CLAUDE_CONFIG_DIR by
+# hand, and claudius should not pretend to know which account that is.
+classify = lambda do |cfg|
+  next [nil, true] if cfg.nil? || cfg.empty?
+  c = real.call(cfg)
+  next [nil, true] if c == groot
+  if c.start_with?(proot + '/')
+    name = c[(proot.length + 1)..].split('/').first
+    next [name, false]
+  end
+  [nil, false]
+end
+
+FINISHED = %w[done stopped failed killed exited error].freeze
+rank = lambda do |st|
+  case st
+  when 'blocked' then 0
+  when 'busy', 'running', 'working' then 1
+  when *FINISHED then 3
+  else 2
+  end
+end
+
+out = rows.map do |r|
+  next nil unless r.is_a?(Hash)
+  sid = r['sessionId'].to_s
+  id = (r['id'] || sid[0, 8]).to_s
+  next nil if id.empty?
+  st = {}
+  if r['kind'] == 'background'
+    st = (JSON.parse(File.read(File.join(cdir, 'jobs', id, 'state.json'))) rescue {})
+    st = {} unless st.is_a?(Hash)
+  end
+  penv = st['providerEnv'].is_a?(Hash) ? st['providerEnv'] : {}
+  cfg = live_roster[id] ||
+        (st.empty? ? nil : (penv['CLAUDE_CONFIG_DIR'] || '')) ||
+        proc_cfg.call(r['pid']) ||
+        dead_roster[id]
+  profile, global = classify.call(cfg)
+  state = (r['state'] || r['status'] || 'unknown').to_s
+  started = r['startedAt'].to_i / 1000
+  updated = ((Time.parse(st['updatedAt']).to_i rescue nil) if st['updatedAt']) || started
+  detail = st['detail'].to_s.gsub(/\s+/, ' ').strip
+  detail = nil if detail.empty? || detail == state
+  intent = st['intent'].to_s.gsub(/\s+/, ' ').strip
+  cwd = r['cwd']
+  short = if cwd.nil? then nil
+          elsif cwd == HOME then '~'
+          elsif cwd.start_with?(HOME + '/') then '~' + cwd[HOME.length..]
+          else cwd
+          end
+  {
+    'id' => id, 'sid' => sid.empty? ? nil : sid, 'kind' => r['kind'],
+    'name' => r['name'], 'state' => state,
+    'profile' => profile, 'global' => global,
+    'config' => global ? nil : (cfg && real.call(cfg)),
+    'cwd' => cwd, 'short' => short,
+    'detail' => detail, 'intent' => intent.empty? ? nil : intent,
+    'started' => started, 'updated' => updated,
+    'pid' => r['pid'], 'live' => alive.call(r['pid']),
+  }
+end.compact
+
+before = out.size
+out.reject! { |a| FINISHED.include?(a['state']) && now - a['updated'] > hide_after } unless all
+hidden = before - out.size
+out.sort_by! { |a| [rank.call(a['state']), -a['updated'], a['id']] }
+
+if mode == 'tsv'
+  # First row: how many finished agents the filter hid, so the board can say so
+  # without listing twice. Readers skip any row that starts with '#'.
+  puts "#\x1f#{hidden}"
+  clean = lambda { |v| v.nil? ? '' : v.to_s.gsub(/[\x00-\x1f]/, ' ') }
+  out.each do |a|
+    puts [a['id'], a['kind'], a['state'], a['profile'], a['global'] ? '1' : '0',
+          a['config'], a['name'], a['detail'], a['short'], a['updated'],
+          a['sid'], a['intent'], a['pid']].map(&clean).join("\x1f")
+  end
+else
+  puts JSON.generate(out)
+end
+RB
+}
+
+# agent_find <id> — resolve one agent (short id, or a prefix of it or of its
+# session id) into AG1_* globals. Looks at finished agents too: removing or
+# re-opening one is the point of naming it.
+agent_find() {
+  local want="$1" line hit="" n=0
+  AG1_ID=""; AG1_KIND=""; AG1_STATE=""; AG1_PROFILE=""; AG1_GLOBAL=""; AG1_CONFIG=""
+  AG1_NAME=""; AG1_PID=""
+  [[ -n "$want" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" == "#"* ]] && continue
+    local f_id f_kind f_state f_prof f_glob f_cfg f_name f_rest f_sid
+    IFS="$AG_US" read -r f_id f_kind f_state f_prof f_glob f_cfg f_name f_rest <<< "$line"
+    f_sid="$(printf '%s' "$line" | cut -d "$AG_US" -f 11)"
+    if [[ "$f_id" == "$want" || "$f_sid" == "$want" ]]; then
+      hit="$line"; n=1; break
+    fi
+    if [[ "$f_id" == "$want"* || "$f_sid" == "$want"* ]]; then
+      hit="$line"; n=$(( n + 1 ))
+    fi
+  done < <(agents_data tsv true)
+  if (( n == 0 )); then
+    echo "No agent '$want'. List them: $(basename "$0") agents" >&2
+    return 1
+  fi
+  if (( n > 1 )); then
+    echo "'$want' matches $n agents; give more of the id." >&2
+    return 1
+  fi
+  local rest
+  IFS="$AG_US" read -r AG1_ID AG1_KIND AG1_STATE AG1_PROFILE AG1_GLOBAL AG1_CONFIG AG1_NAME rest <<< "$hit"
+  AG1_PID="$(printf '%s' "$hit" | cut -d "$AG_US" -f 13)"
+  return 0
+}
+
+# Run `claude <args>` as the config dir that owns the agent found by agent_find.
+# For the control verbs that only talk to a supervisor (logs, stop, rm) — none of
+# them starts a worker, so none needs a credential prepared.
+agent_claude() {
+  if [[ "$AG1_GLOBAL" == 1 ]]; then
+    claude "$@"
+  elif [[ -n "$AG1_CONFIG" ]]; then
+    env CLAUDE_CONFIG_DIR="$AG1_CONFIG" claude "$@"
+  else
+    echo "Cannot tell which account owns agent $AG1_ID." >&2
+    return 1
+  fi
+}
+
+# agent_ctl <attach|logs|stop|rm> <id> [extra args for rm]
+agent_ctl() {
+  local verb="$1" id="${2:-}"
+  shift 2 2>/dev/null || shift $#
+  if [[ -z "$id" ]]; then
+    echo "usage: $(basename "$0") agents $verb <id>" >&2
+    return 2
+  fi
+  agent_find "$id" || return 1
+  if [[ "$AG1_KIND" != background ]]; then
+    printf 'Agent %s is an interactive session (pid %s) — it lives in the terminal that started it.\n' \
+      "$AG1_ID" "${AG1_PID:-?}" >&2
+    return 1
+  fi
+  case "$verb" in
+    attach)
+      # attach can bring a stopped agent back, which starts a worker and so needs
+      # the owner's credential in the right scope — the job `run` exists to do.
+      # Hence run_profile for a profile, never a bare CLAUDE_CONFIG_DIR: on macOS
+      # that would skip the Keychain seeding and could fork the live account's
+      # refresh chain.
+      if [[ "$AG1_GLOBAL" == 1 ]]; then
+        claude attach "$AG1_ID"
+      elif [[ -n "$AG1_PROFILE" ]]; then
+        ( run_profile "$AG1_PROFILE" attach "$AG1_ID" )
+      else
+        echo "Agent $AG1_ID belongs to $AG1_CONFIG, which is not a claudius profile; attach it from there." >&2
+        return 1
+      fi
+      ;;
+    logs) agent_claude logs "$AG1_ID" ;;
+    stop) agent_claude stop "$AG1_ID" ;;
+    rm)   if (( $# > 0 )); then agent_claude rm "$AG1_ID" "$@"; else agent_claude rm "$AG1_ID"; fi ;;
+    *)    echo "Unknown agents action: $verb" >&2; return 2 ;;
+  esac
+}
+
+# A worktree name from a task title: lower-case, dashes, 40 columns.
+agent_slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' \
+    | sed 's/^-*//; s/-*$//' | cut -c1-40 | sed 's/-*$//'
+}
+
+# The accounts in `next`'s order, one per line: name \x1f why \x1f eligible(1/0).
+agent_accounts() {
+  local profiles hist
+  profiles="$(list_profiles_json)"
+  hist="$(usage_history_json 0)"
+  ruby - "$(next_json "$profiles" "$hist")" <<'RB'
+require 'json'
+d = (JSON.parse(ARGV[0].to_s) rescue {})
+(d['ranked'] || []).each do |r|
+  puts [r['name'], r['why'].to_s.gsub(/[\x00-\x1f]/, ' '), r['eligible'] ? '1' : '0'].join("\x1f")
+end
+RB
+}
+
+# agent_new <profile> <name> <worktree-or-empty> <message>
+# Dispatch through run_profile, in a subshell: run exec's into claude, and
+# `claude --bg` returns as soon as the agent is handed to its supervisor, so the
+# subshell is what comes back here rather than the caller being replaced.
+agent_new() {
+  local profile="$1" name="$2" wt="$3" msg="$4"
+  if [[ -n "$wt" ]]; then
+    ( run_profile "$profile" --bg -n "$name" -w "$wt" "$msg" )
+  else
+    ( run_profile "$profile" --bg -n "$name" "$msg" )
+  fi
+}
+
+# ── Agents board (TUI) ────────────────────────────────────────────────────────
+AG_ID=(); AG_KIND=(); AG_STATE=(); AG_PROFILE=(); AG_GLOBAL=(); AG_NAME=()
+AG_DETAIL=(); AG_SHORT=(); AG_UPDATED=(); AG_SID=(); AG_INTENT=(); AG_PID=()
+AG_N=0
+AG_HIDDEN=0
+
+agents_load() {
+  local all="$1" line i=0
+  AG_ID=(); AG_KIND=(); AG_STATE=(); AG_PROFILE=(); AG_GLOBAL=(); AG_NAME=()
+  AG_DETAIL=(); AG_SHORT=(); AG_UPDATED=(); AG_SID=(); AG_INTENT=(); AG_PID=()
+  AG_HIDDEN=0
+  while IFS= read -r line; do
+    if [[ "$line" == "#"* ]]; then AG_HIDDEN="${line#*"$AG_US"}"; continue; fi
+    local a b c d e f g h k l m n o
+    IFS="$AG_US" read -r a b c d e f g h k l m n o <<< "$line"
+    AG_ID[i]="$a"; AG_KIND[i]="$b"; AG_STATE[i]="$c"; AG_PROFILE[i]="$d"; AG_GLOBAL[i]="$e"
+    AG_NAME[i]="$g"; AG_DETAIL[i]="$h"; AG_SHORT[i]="$k"; AG_UPDATED[i]="$l"
+    AG_SID[i]="$m"; AG_INTENT[i]="$n"; AG_PID[i]="$o"
+    i=$(( i + 1 ))
+  done < <(agents_data tsv "$all")
+  AG_N=$i
+}
+
+# How a state reads on the board, and its glyph + colour.
+agent_state_label() {
+  case "$1" in
+    blocked) printf 'needs you' ;;
+    busy|running|working) printf 'working' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+agent_state_glyph() {
+  case "$1" in
+    blocked) printf '%s◐' "$C_AMBER" ;;
+    busy|running|working) printf '%s●' "$C_ACCENT" ;;
+    idle) printf '%s○' "$C_MUTED" ;;
+    done) printf '%s✓' "$C_GREEN" ;;
+    failed|error|killed) printf '%s✗' "$C_RED" ;;
+    *) printf '%s■' "$C_MUTED" ;;
+  esac
+}
+
+# Who an agent is on, as shown: the profile; for one on the global ~/.claude, the
+# live profile with a '*' (it follows whatever is activated); '?' when unknown.
+agent_account_label() {
+  local i="$1" active="$2"
+  if [[ -n "${AG_PROFILE[$i]}" ]]; then printf '%s' "${AG_PROFILE[$i]}"
+  elif [[ "${AG_GLOBAL[$i]}" == 1 ]]; then printf '%s*' "${active:-live}"
+  else printf '?'; fi
+}
+
+agent_age() {
+  local ts="$1" now diff
+  [[ "$ts" =~ ^[0-9]+$ ]] || { printf '–'; return; }
+  now="$(date +%s)"; diff=$(( now - ts )); (( diff < 0 )) && diff=0
+  if (( diff < 60 )); then printf '%ds' "$diff"
+  elif (( diff < 3600 )); then printf '%dm' $(( diff / 60 ))
+  elif (( diff < 86400 )); then printf '%dh' $(( diff / 3600 ))
+  else printf '%dd' $(( diff / 86400 )); fi
+}
+
+agents_render() {
+  local sel="$1" top="$2" note="$3" active="$4" next_line="$5" all="$6"
+  local cols lines card
+  cols="$(term_cols)"
+  lines="$(tput lines 2>/dev/null || echo 24)"; [[ "$lines" =~ ^[0-9]+$ ]] || lines=24
+  card=$(( cols - 4 )); (( card > 110 )) && card=110; (( card < 50 )) && card=50
+  local rule="" i
+  for (( i = 0; i < card; i++ )); do rule+="─"; done
+
+  local out="" nl=$'\n' clr=$'\033[K'
+  add() { out+="$1$clr$nl"; }
+
+  # Counts by what they ask of you.
+  local n_need=0 n_work=0 n_idle=0 n_fin=0
+  for (( i = 0; i < AG_N; i++ )); do
+    case "${AG_STATE[$i]}" in
+      blocked) n_need=$(( n_need + 1 )) ;;
+      busy|running|working) n_work=$(( n_work + 1 )) ;;
+      done|stopped|failed|killed|exited|error) n_fin=$(( n_fin + 1 )) ;;
+      *) n_idle=$(( n_idle + 1 )) ;;
+    esac
+  done
+  local counts="${n_need} need you · ${n_work} working · ${n_idle} idle · ${n_fin} finished"
+  (( AG_HIDDEN > 0 )) && counts+="  ${C_MUTED}+${AG_HIDDEN} older${C_RESET}"
+  [[ "$all" == true ]] && counts+="  ${C_MUTED}all shown${C_RESET}"
+
+  hide_cursor
+  add ""
+  add "  ${C_TITLE}Agents${C_RESET}   ${counts}"
+  add "  ${C_MUTED}next account:${C_RESET} ${next_line}"
+  add "  ${C_RULE}${rule}${C_RESET}"
+
+  # Column widths: glyph 2 · id 9 · name flex · account 12 · state 10 · age 4.
+  local w_acc=12 w_state=10 w_age=4
+  local w_name=$(( card - 2 - 2 - 9 - w_acc - w_state - w_age - 3 ))
+  (( w_name < 12 )) && w_name=12
+  local room=$(( (lines - 12) / 2 )); (( room < 1 )) && room=1
+
+  if (( AG_N == 0 )); then
+    add ""
+    add "  ${C_MUTED}No agents yet. Press${C_RESET} ${C_KEY}n${C_RESET} ${C_MUTED}to start one.${C_RESET}"
+    add ""
+  fi
+  local end=$(( top + room )); (( end > AG_N )) && end=$AG_N
+  (( top > 0 )) && add "  ${C_MUTED}  ↑ ${top} more${C_RESET}"
+  for (( i = top; i < end; i++ )); do
+    local acc label age plain sub
+    acc="$(agent_account_label "$i" "$active")"
+    label="$(agent_state_label "${AG_STATE[$i]}")"
+    age="$(agent_age "${AG_UPDATED[$i]}")"
+    local nm="${AG_NAME[$i]:-(unnamed)}"
+    [[ "${AG_KIND[$i]}" == interactive ]] && nm="$nm  [terminal]"
+    plain="$(pad_to 9 "${AG_ID[$i]}")$(pad_to "$w_name" "$nm") $(pad_to "$w_acc" "$acc") $(pad_to "$w_state" "$label") $(printf '%4s' "$age")"
+    sub="${AG_DETAIL[$i]:-${AG_SHORT[$i]}}"
+    if (( i == sel )); then
+      add "  ${C_SEL}$(pad_to "$card" "${GLYPH_POINTER} ${plain}")${C_RESET}"
+    else
+      add "  $(agent_state_glyph "${AG_STATE[$i]}")${C_RESET} ${plain}"
+    fi
+    add "  ${C_MUTED}           ↳ $(trunc $(( card - 14 )) "$sub")${C_RESET}"
+  done
+  (( end < AG_N )) && add "  ${C_MUTED}  ↓ $(( AG_N - end )) more${C_RESET}"
+
+  add "  ${C_RULE}${rule}${C_RESET}"
+  if (( AG_N > 0 )); then
+    local where="${AG_SHORT[$sel]:-?}" acc
+    acc="$(agent_account_label "$sel" "$active")"
+    add "  ${C_MUTED}task:${C_RESET} $(trunc $(( card - 8 )) "${AG_INTENT[$sel]:-${AG_NAME[$sel]}}")"
+    add "  ${C_MUTED}in${C_RESET} ${where}  ${C_MUTED}on${C_RESET} ${acc}  ${C_MUTED}session${C_RESET} ${AG_SID[$sel]:-?}"
+  fi
+  if [[ -n "$note" ]]; then
+    add "  ${C_AMBER}${note}${C_RESET}"
+  else
+    add "  ${C_MUTED}* = runs on the live ~/.claude account${C_RESET}"
+  fi
+  add "  ${C_KEY}↑↓${C_RESET}${C_MUTED} move  ${C_RESET}${C_KEY}⏎${C_RESET}${C_MUTED} open  ${C_RESET}${C_KEY}l${C_RESET}${C_MUTED} log  ${C_RESET}${C_KEY}n${C_RESET}${C_MUTED} new  ${C_RESET}${C_KEY}s${C_RESET}${C_MUTED} stop  ${C_RESET}${C_KEY}x${C_RESET}${C_MUTED} remove  ${C_RESET}${C_KEY}a${C_RESET}${C_MUTED} all  ${C_RESET}${C_KEY}q${C_RESET}${C_MUTED} quit${C_RESET}"
+
+  printf '\033[H%s\033[J' "$out"
+  unset -f add
+}
+
+# The "new agent" form: two typed lines, then a confirm screen where the account
+# and the worktree are picked with keys rather than typed. Returns 0 when an agent
+# was dispatched, 1 when cancelled.
+agents_new_dialog() {
+  local name msg
+  disable_raw_mode
+  clear_screen; show_cursor
+  printf '\n  %sNew agent%s   %s(empty task cancels)%s\n\n' "$C_TITLE" "$C_RESET" "$C_MUTED" "$C_RESET"
+  IFS= read -r -e -p "  task     " name || name=""
+  [[ -n "$name" ]] || { enable_raw_mode; return 1; }
+  IFS= read -r -e -p "  message  " msg || msg=""
+  [[ -n "$msg" ]] || msg="$name"
+
+  local accs=() whys=() line
+  while IFS= read -r line; do
+    accs+=("${line%%"$AG_US"*}")
+    local rest="${line#*"$AG_US"}"
+    whys+=("${rest%%"$AG_US"*}")
+  done < <(agent_accounts)
+  if (( ${#accs[@]} == 0 )); then
+    printf '\n  %sNo profiles yet — add one first: %s add%s\n' "$C_AMBER" "$(basename "$0")" "$C_RESET"
+    sleep 2; enable_raw_mode; return 1
+  fi
+
+  local top branch="" use_wt=false slug
+  top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$top" ]]; then
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    use_wt=true
+  fi
+  slug="$(agent_slug "$name")"
+  [[ -n "$slug" ]] || slug="agent-$(date +%H%M%S)"
+
+  local ai=0 key nl=$'\n' clr=$'\033[K'
+  enable_raw_mode
+  while true; do
+    hide_cursor
+    local wt_line
+    if [[ -z "$top" ]]; then
+      wt_line="${C_MUTED}none — $(pwd) is not a git repository${C_RESET}"
+    elif [[ "$use_wt" == true ]]; then
+      wt_line="‹ new worktree: ${C_BOLD}${slug}${C_RESET} ›  ${C_MUTED}own checkout, branched from ${branch:-HEAD}${C_RESET}"
+    else
+      wt_line="‹ this checkout ›  ${C_MUTED}shares ${branch:-HEAD} with whatever else works here${C_RESET}"
+    fi
+    local o=""
+    o+="$clr$nl  ${C_TITLE}New agent${C_RESET}$clr$nl$clr$nl"
+    o+="  ${C_MUTED}task     ${C_RESET}$(trunc 80 "$name")$clr$nl"
+    o+="  ${C_MUTED}message  ${C_RESET}$(trunc 80 "$msg")$clr$nl"
+    o+="  ${C_MUTED}in       ${C_RESET}${top:-$(pwd)}$clr$nl$clr$nl"
+    o+="  ${C_MUTED}account  ${C_RESET}‹ ${C_BOLD}${accs[$ai]}${C_RESET} ›  ${C_MUTED}${whys[$ai]}${C_RESET}$clr$nl"
+    o+="  ${C_MUTED}worktree ${C_RESET}${wt_line}$clr$nl$clr$nl"
+    o+="  ${C_KEY}←→${C_RESET}${C_MUTED} account  ${C_RESET}"
+    [[ -n "$top" ]] && o+="${C_KEY}w${C_RESET}${C_MUTED} worktree on/off  ${C_RESET}"
+    o+="${C_KEY}⏎${C_RESET}${C_MUTED} start  ${C_RESET}${C_KEY}esc${C_RESET}${C_MUTED} cancel${C_RESET}$clr$nl"
+    printf '\033[H%s\033[J' "$o"
+    read_key key || return 1
+    case "$key" in
+      $'\e[C'|$'\eOC') ai=$(( (ai + 1) % ${#accs[@]} )) ;;
+      $'\e[D'|$'\eOD') ai=$(( (ai + ${#accs[@]} - 1) % ${#accs[@]} )) ;;
+      w|W) [[ -n "$top" ]] && { [[ "$use_wt" == true ]] && use_wt=false || use_wt=true; } ;;
+      $'\e'|q|Q) return 1 ;;
+      $'\n')
+        disable_raw_mode; show_cursor
+        printf '\n  %sstarting on %s…%s\n\n' "$C_ACCENT" "${accs[$ai]}" "$C_RESET"
+        local wt=""; [[ "$use_wt" == true ]] && wt="$slug"
+        local rc=0
+        agent_new "${accs[$ai]}" "$name" "$wt" "$msg" || rc=$?
+        if (( rc != 0 )); then
+          printf '\n  %scould not start it (exit %d) — press a key%s' "$C_AMBER" "$rc" "$C_RESET"
+          enable_raw_mode; read_key key || true
+          return 1
+        fi
+        enable_raw_mode
+        return 0
+        ;;
+    esac
+  done
+}
+
+agents_board() {
+  local all=false sel=0 top=0 note="" reload=true key rc
+  local active next_line
+  active="$(get_active_profile || true)"
+
+  next_summary() {
+    local first; first="$(agent_accounts | head -n 1)"
+    if [[ -z "$first" ]]; then next_line="${C_MUTED}no profiles${C_RESET}"; return; fi
+    local nm="${first%%"$AG_US"*}" rest="${first#*"$AG_US"}"
+    local why="${rest%%"$AG_US"*}" ok="${rest##*"$AG_US"}"
+    if [[ "$ok" == 1 ]]; then next_line="${C_ACCENT}${nm}${C_RESET} ${C_MUTED}— ${why}${C_RESET}"
+    else next_line="${C_AMBER}none usable${C_RESET} ${C_MUTED}— ${nm}: ${why}${C_RESET}"; fi
+  }
+  # Hand the terminal to something else (attach, a pager) and take it back after.
+  away() { disable_raw_mode; leave_alt_screen; show_cursor; }
+  back() { enable_raw_mode; enter_alt_screen; clear_screen; }
+
+  next_summary
+  enable_raw_mode
+  enter_alt_screen
+  clear_screen
+  while true; do
+    if [[ "$reload" == true ]]; then
+      agents_load "$all"
+      reload=false
+    fi
+    (( sel >= AG_N )) && sel=$(( AG_N - 1 ))
+    (( sel < 0 )) && sel=0
+    local lines room
+    lines="$(tput lines 2>/dev/null || echo 24)"; [[ "$lines" =~ ^[0-9]+$ ]] || lines=24
+    room=$(( (lines - 12) / 2 )); (( room < 1 )) && room=1
+    (( sel < top )) && top=$sel
+    (( sel >= top + room )) && top=$(( sel - room + 1 ))
+    agents_render "$sel" "$top" "$note" "$active" "$next_line" "$all"
+
+    # A refresh tick keeps the note; only a key clears it — otherwise a result
+    # such as "stop sent" would vanish within 3s, possibly unread.
+    rc=0; read_key key 3 || rc=$?
+    if (( rc == 2 )); then reload=true; continue; fi
+    (( rc == 0 )) || break
+    note=""
+
+    case "$key" in
+      q|Q|$'\e') break ;;
+      $'\e[A'|$'\eOA') (( AG_N > 0 )) && sel=$(( (sel + AG_N - 1) % AG_N )) ;;
+      $'\e[B'|$'\eOB') (( AG_N > 0 )) && sel=$(( (sel + 1) % AG_N )) ;;
+      a|A) [[ "$all" == true ]] && all=false || all=true; reload=true ;;
+      r|R) reload=true; next_summary ;;
+      n|N)
+        if agents_new_dialog; then
+          note="started — it shows up here once its supervisor lists it"
+        fi
+        clear_screen; reload=true; next_summary
+        ;;
+      $'\n'|l|L|s|S|x|X)
+        (( AG_N > 0 )) || continue
+        local id="${AG_ID[$sel]}"
+        if [[ "${AG_KIND[$sel]}" != background ]]; then
+          note="${id} is a terminal session (pid ${AG_PID[$sel]:-?}) — switch to that terminal"
+          continue
+        fi
+        case "$key" in
+          $'\n')
+            away
+            agent_ctl attach "$id" || { printf '\n  press a key '; enable_raw_mode; read_key key || true; }
+            back; reload=true
+            ;;
+          l|L)
+            away
+            if command -v less >/dev/null 2>&1; then
+              agent_ctl logs "$id" 2>&1 | less -R
+            else
+              agent_ctl logs "$id" 2>&1; printf '\n  press a key '; enable_raw_mode; read_key key || true
+            fi
+            back
+            ;;
+          s|S|x|X)
+            local verb=stop what="Stop"
+            [[ "$key" == x || "$key" == X ]] && { verb=rm; what="Remove (and its worktree when that is safe)"; }
+            agents_render "$sel" "$top" "$what ${id} — ${AG_NAME[$sel]}? [y/N]" "$active" "$next_line" "$all"
+            local yn; read_key yn || yn=""
+            if [[ "$yn" == y || "$yn" == Y ]]; then
+              local res
+              res="$(agent_ctl "$verb" "$id" 2>&1)" || true
+              note="$(printf '%s' "$res" | tr '\n' ' ' | cut -c1-200)"
+              [[ -n "$note" ]] || note="${verb} sent to ${id}"
+              reload=true
+            fi
+            ;;
+        esac
+        ;;
+    esac
+  done
+  disable_raw_mode
+  leave_alt_screen
+  unset -f next_summary away back
+}
+
+# Plain listing for a pipe or a non-tty.
+agents_table() {
+  local all="$1" active
+  active="$(get_active_profile || true)"
+  # Passed as an argument, not piped: `ruby -` reads its program from stdin.
+  ruby - "$active" "$(agents_data tsv "$all")" <<'RB'
+active = ARGV[0]
+rows = ARGV[1].to_s.split("\n").reject { |l| l.start_with?('#') }.map { |l| l.split("\x1f", -1) }
+if rows.empty?
+  puts 'No agents.'
+  exit 0
+end
+now = Time.now.to_i
+age = lambda do |t|
+  s = now - t.to_i
+  s < 60 ? "#{s}s" : s < 3600 ? "#{s / 60}m" : s < 86_400 ? "#{s / 3600}h" : "#{s / 86_400}d"
+end
+rows.each do |id, kind, state, prof, glob, _cfg, name, detail, short, upd|
+  acc = !prof.to_s.empty? ? prof : glob == '1' ? "#{active.empty? ? 'live' : active}*" : '?'
+  label = { 'blocked' => 'needs you', 'busy' => 'working' }[state] || state
+  nm = name.to_s.empty? ? '(unnamed)' : name
+  nm += '  [terminal]' if kind == 'interactive'
+  puts format('%-8s  %-12s %-10s %4s  %s', id, acc, label, age.call(upd), nm)
+  puts "          ↳ #{(detail.to_s.empty? ? short : detail).to_s[0, 110]}"
+end
+puts
+puts '* = on the live ~/.claude account'
+RB
+}
+
+# claudius agents [--json] [--all]
+# claudius agents new [--profile P|auto] [--name N] [--worktree W|--no-worktree] <message…>
+# claudius agents attach|logs|stop|rm <id>
+cmd_agents() {
+  case "${1:-}" in
+    attach|open) shift; agent_ctl attach "$@"; return ;;
+    logs|log)    shift; agent_ctl logs "$@"; return ;;
+    stop|kill)   shift; agent_ctl stop "$@"; return ;;
+    rm|remove)   shift; agent_ctl rm "$@"; return ;;
+    new|start)   shift; cmd_agents_new "$@"; return ;;
+  esac
+  local json=false all=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json=true; shift ;;
+      --all)  all=true; shift ;;
+      *) echo "usage: $(basename "$0") agents [--json] [--all] | new … | attach|logs|stop|rm <id>" >&2; return 2 ;;
+    esac
+  done
+  if [[ "$json" == true ]]; then
+    agents_data json "$all"
+    return 0
+  fi
+  if [[ -t 0 && -t 1 ]]; then
+    agents_board
+  else
+    agents_table "$all"
+  fi
+}
+
+cmd_agents_new() {
+  local profile=auto name="" wt="" wt_set=false msg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile|-p) profile="${2:-}"; shift 2 || shift ;;
+      --name|-n)    name="${2:-}"; shift 2 || shift ;;
+      --worktree|-w) wt="${2:-}"; wt_set=true; shift 2 || shift ;;
+      --no-worktree) wt=""; wt_set=true; shift ;;
+      --) shift; msg="$*"; break ;;
+      -*) echo "Unknown option: $1" >&2; return 2 ;;
+      *)  msg="$*"; break ;;
+    esac
+  done
+  if [[ -z "$msg" ]]; then
+    echo "usage: $(basename "$0") agents new [--profile P|auto] [--name N] [--worktree W|--no-worktree] <message…>" >&2
+    return 2
+  fi
+  [[ -n "$name" ]] || name="$(printf '%s' "$msg" | cut -c1-50)"
+  if [[ "$profile" == auto || -z "$profile" ]]; then
+    # Same ranking as `next`, and the same refusal: nothing usable is an error,
+    # not a reason to dispatch on an account that is at its limit.
+    profile="$(cmd_next 2>/dev/null || true)"
+    if [[ -z "$profile" ]]; then
+      cmd_next >/dev/null || true   # again, for its explanation on stderr
+      return 1
+    fi
+  fi
+  # A worktree by default when there is a repository to make one in, named after
+  # the task; --no-worktree puts the agent in this checkout, alongside whatever
+  # else works on this branch.
+  if [[ "$wt_set" == false ]] && git rev-parse --show-toplevel >/dev/null 2>&1; then
+    wt="$(agent_slug "$name")"
+  fi
+  agent_new "$profile" "$name" "$wt" "$msg"
+}
+
 cmd_list() {
   if [[ "${1:-}" == "--json" ]]; then
     list_profiles_json
@@ -3335,6 +4051,14 @@ ${C_MUTED}USAGE${C_RESET}
                              usage over time: burn rate + when you hit a limit
   $prog sessions [--json] [--limit N]
                              list the shared session pool, newest first
+  $prog agents [--json] [--all]
+                             board of Claude Code's background agents across
+                             every account: open, read, start, stop, remove
+  $prog agents new [--profile P|auto] [--name N] [--worktree W|--no-worktree] <msg>
+                             start a background agent (default: the account
+                             'next' picks, in a new worktree named after it)
+  $prog agents attach|logs|stop|rm <id>
+                             the same, through the account that owns <id>
   $prog refresh <profile>    renew token if needed & rewrite the usage cache
   $prog activate <profile>   switch the global ~/.claude to <profile>
   $prog run [profile] [args] open a session in <profile> without switching
@@ -3395,6 +4119,7 @@ main() {
     ""|menu)   show_menu; disable_raw_mode; leave_alt_screen ;;
     list)      cmd_list "$@" ;;
     sessions)  cmd_sessions "$@" ;;
+    agents)    cmd_agents "$@" ;;
     next)      cmd_next "$@" ;;
     history)   cmd_history "$@" ;;
     status)    cmd_status "$@" ;;

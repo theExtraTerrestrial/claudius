@@ -52,6 +52,18 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   `short` is `cwd` with `$HOME` written as `~`; `exists` is whether the directory
   is still there. `--limit 0` means the whole pool and is not a mistake.
   Never decode a path from `dirkey`; that encoding is lossy.
+- `claudius agents --json [--all]` →
+  `[{id, sid, kind, name, state, profile, global, config, cwd, short, detail,
+  intent, started, updated, pid, live}]`, needs-you first, then working, idle,
+  finished. It is Claude Code's own `claude agents --json --all` plus ownership;
+  claudius records nothing. `profile` is null both for the global `~/.claude`
+  (`global: true`) and for a hand-set config dir outside the profile root
+  (`global: false`, `config` set) — never guess a profile for the second.
+  Ownership order is documented above `agents_data`; keep it there. Every
+  attach/logs/stop/rm goes through the OWNER's config dir (each runs its own
+  supervisor), and attach goes through `run_profile`, never a bare
+  `CLAUDE_CONFIG_DIR`, because it can start a worker that needs a credential.
+  Finished agents older than a day are hidden unless `--all`.
 - `.usage` → `u5 u7 uts r5 r7`, space-separated. Write `-` for a missing window;
   never omit a field.
 - `.usage.log` → one sample per line, `ts u5 u7 r5 r7`, timestamp FIRST (a log is
@@ -188,6 +200,10 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   `.usage.log` format, `usage_history_json` or `next_json`. Throwaway `HOME`,
   every sample written by the test, no API call — the rate segmentation and the
   pruning rules are the parts that would otherwise fail silently and slowly.
+- Run `bash tests/agents.sh` (43 assertions, ~15s) after any change to
+  `agents_data`, `agent_find`, `agent_ctl`, `cmd_agents` or `cmd_agents_new`.
+  `claude` is a stub on PATH serving a fixture listing and logging
+  `<config dir>|argv…`, so routing to the owning account is asserted, not assumed.
 - Verify TUI changes by hand — there is no suite for the TUI. It shows no
   burn rate and no recommendation; that is a gap, not a decision.
 - Do not claim macOS behaviour works. It cannot be tested here; say so.

@@ -50,6 +50,10 @@ claudius activate <profile>   switch the global ~/.claude to <profile>
 claudius run [profile] [args] open a claude session in <profile> WITHOUT
                               switching the global account (no name = pick)
 claudius link <profile>       (re)wire a profile for shared sessions, no launch
+claudius agents [--json] [--all]
+                              board of background agents across every account
+claudius agents new [--profile P|auto] [--name N] [--worktree W|--no-worktree] <msg>
+claudius agents attach|logs|stop|rm <id>
 claudius add [name] [--no-activate]
                               add a new profile (interactive browser login)
 claudius relogin <profile>    sign a profile back in when its token can no
@@ -193,6 +197,52 @@ refreshed token lands in the profile's own Keychain item and Claude Code deletes
 the plaintext copy. claudius syncs it back when the session exits, and `activate`
 and the usage refresh recover it too, so the profile is never left looking
 credential-less.
+
+## Parallel work (`agents`)
+
+Claude Code runs agents in the background (`claude --bg`), each optionally in its
+own git worktree, and lists them with `claude agents`. Because `run` shares
+`sessions/` and `jobs/` across profiles, that one list already holds the agents of
+**every** account — what it does not say is which account each runs on, and that
+matters: every config dir has its own supervisor, so attaching, stopping or
+reading an agent has to go through the account that owns it.
+
+`claudius agents` is that list made account-aware, as a board:
+
+```
+  Agents   1 need you · 2 working · 3 idle · 4 finished  +6 older
+  next account: erhards2 — 62% left on the 5h
+  ───────────────────────────────────────────────────────────────────
+  ➜ 09161075 maternity leave edge case          erhards*   needs you  44m
+             ↳ Is there a JIRA key for the commit message?
+  ● 3f1c0a92 WS-1600 login timeout              erhards2   working     2m
+             ↳ running the auth specs
+  ✓ 0aef439b create worktree ws-1514            erhards2   done        1d
+             ↳ PR #2461 is open and came through review clean
+```
+
+Agents that need you sort first; the second line is what the agent last reported,
+so you can review it without opening it. `⏎` opens one (through its own account),
+`l` reads its recent output, `n` starts a new one, `s` stops, `x` removes (and its
+worktree, when that is safe), `a` shows the older finished ones. The board
+refreshes itself every few seconds.
+
+`n` asks for a task and a first message, then lets you pick the account (←→,
+pre-set to what `next` ranks first) and whether the agent gets **its own
+worktree** (the default inside a repo, named after the task) or works in **this
+checkout** alongside whatever else is on that branch. The same from a script:
+
+```
+claudius agents new "fix the login timeout in WS-1600"          # account: auto
+claudius agents new --profile work --no-worktree "update the changelog"
+```
+
+claudius records nothing for this. Ownership is read back from Claude Code's own
+files: a live supervisor's roster, the job's record of the config dir it was
+dispatched from, an interactive session's environment. A `*` marks an agent on
+the global `~/.claude`, which is whichever account is live. Interactive sessions
+are listed too, marked `[terminal]`; they live in the terminal that started them
+and are not opened from here.
 
 ## Dashboard
 
