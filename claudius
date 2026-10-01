@@ -2845,13 +2845,132 @@ end
 RB
 }
 
+# agent_transcript <session id> <colour:true|false> — the conversation, readable.
+# Not `claude logs`: that is the agent's raw terminal output (carriage returns,
+# cursor moves, redraws) and only a terminal emulator could make sense of it. The
+# transcript says what was actually done — what you asked, what Claude answered,
+# one line per tool call, and the tool calls that failed — and it exists for a
+# session in a terminal just as much as for a background one.
+#
+# Transcripts run to tens of MB, almost all of it tool results carrying whole
+# files. Those are never shown, so a line too long to be anything else is skipped
+# unparsed. Same pool lookup as sessions_json: by session id, never decoded from
+# the directory name.
+agent_transcript() {
+  ruby - "$CLAUDE_DIR/projects" "$1" "${2:-false}" <<'RB'
+require 'json'
+require 'time'
+root, sid, color = ARGV
+color = color == 'true'
+path = Dir.glob(File.join(root, '*', "#{sid}.jsonl")).first
+unless path && sid =~ /\A[0-9a-f-]{8,}\z/
+  puts "No transcript for session #{sid} yet."
+  exit 0
+end
+
+c = lambda { |code, s| color ? "\e[#{code}m#{s}\e[0m" : s }
+WIDTH = 100
+wrap = lambda do |text, indent|
+  text.to_s.split("\n").flat_map do |para|
+    next [''] if para.strip.empty?
+    lines = []
+    cur = +''
+    para.split(/(\s+)/).each do |w|
+      if (cur + w).length > WIDTH - indent.length && !cur.strip.empty?
+        lines << cur.rstrip
+        cur = w.lstrip
+      else
+        cur << w
+      end
+    end
+    lines << cur.rstrip
+    lines
+  end.map { |l| indent + l }
+end
+one = lambda { |s, n = 110| s = s.to_s.gsub(/\s+/, ' ').strip; s.length > n ? s[0, n - 1] + '…' : s }
+
+# The most telling argument of a tool call, by the names the tools use.
+tool_line = lambda do |b|
+  i = b['input'].is_a?(Hash) ? b['input'] : {}
+  arg = i['description'] || i['command'] || i['file_path'] || i['path'] ||
+        i['pattern'] || i['url'] || i['query'] || i['prompt'] || i['subject'] ||
+        i.values.find { |v| v.is_a?(String) }
+  "#{b['name']}#{arg ? '  ' + one.call(arg) : ''}"
+end
+
+out = []
+who = nil
+day = nil
+stamp = lambda do |ts|
+  t = (Time.parse(ts).localtime rescue nil)
+  next '' unless t
+  d = t.strftime('%F')
+  s = d == day ? t.strftime('%H:%M') : t.strftime('%b %-d %H:%M')
+  day = d
+  s
+end
+head = lambda do |role, ts|
+  next if who == role
+  who = role
+  out << ''
+  label = role == :you ? c.call('1;36', 'you') : c.call('1;34', 'claude')
+  out << "#{label}  #{c.call('2', stamp.call(ts))}"
+end
+
+File.foreach(path) do |line|
+  next if line.bytesize > 200_000
+  o = (JSON.parse(line) rescue nil)
+  next unless o.is_a?(Hash)
+  next if o['isSidechain'] || o['isMeta']
+  m = o['message']
+  next unless m.is_a?(Hash)
+  blocks = m['content'].is_a?(Array) ? m['content'] : [{ 'type' => 'text', 'text' => m['content'].to_s }]
+  case o['type']
+  when 'user'
+    blocks.each do |b|
+      if b['type'] == 'text'
+        t = b['text'].to_s.strip
+        next if t.empty?
+        # Harness-injected turns (reminders, local command output) are not you.
+        if t.start_with?('<')
+          cmd = t[%r{<command-name>([^<]+)</command-name>}, 1]
+          next unless cmd
+          t = cmd
+        end
+        head.call(:you, o['timestamp'])
+        out.concat(wrap.call(t, '  '))
+      elsif b['type'] == 'tool_result' && b['is_error']
+        body = b['content'].is_a?(Array) ? b['content'].map { |x| x['text'] }.compact.join(' ') : b['content']
+        out << c.call('31', "    ✗ #{one.call(body, 100)}")
+      end
+    end
+  when 'assistant'
+    blocks.each do |b|
+      case b['type']
+      when 'text'
+        t = b['text'].to_s.strip
+        next if t.empty?
+        head.call(:claude, o['timestamp'])
+        out.concat(wrap.call(t, '  '))
+      when 'tool_use'
+        head.call(:claude, o['timestamp'])
+        out << c.call('2', "    ▸ #{tool_line.call(b)}")
+      end
+    end
+  end
+end
+out << '' << c.call('2', "── end of transcript · #{File.basename(path)}")
+puts out
+RB
+}
+
 # agent_find <id> — resolve one agent (short id, or a prefix of it or of its
 # session id) into AG1_* globals. Looks at finished agents too: removing or
 # re-opening one is the point of naming it.
 agent_find() {
   local want="$1" line hit="" n=0
   AG1_ID=""; AG1_KIND=""; AG1_STATE=""; AG1_PROFILE=""; AG1_GLOBAL=""; AG1_CONFIG=""
-  AG1_NAME=""; AG1_PID=""
+  AG1_NAME=""; AG1_PID=""; AG1_SID=""
   [[ -n "$want" ]] || return 1
   while IFS= read -r line; do
     [[ "$line" == "#"* ]] && continue
@@ -2876,6 +2995,7 @@ agent_find() {
   local rest
   IFS="$AG_US" read -r AG1_ID AG1_KIND AG1_STATE AG1_PROFILE AG1_GLOBAL AG1_CONFIG AG1_NAME rest <<< "$hit"
   AG1_PID="$(printf '%s' "$hit" | cut -d "$AG_US" -f 13)"
+  AG1_SID="$(printf '%s' "$hit" | cut -d "$AG_US" -f 11)"
   return 0
 }
 
@@ -3099,7 +3219,7 @@ agents_render() {
   else
     add "  ${C_MUTED}* = runs on the live ~/.claude account${C_RESET}"
   fi
-  add "  ${C_KEY}↑↓${C_RESET}${C_MUTED} move  ${C_RESET}${C_KEY}⏎${C_RESET}${C_MUTED} open  ${C_RESET}${C_KEY}l${C_RESET}${C_MUTED} log  ${C_RESET}${C_KEY}n${C_RESET}${C_MUTED} new  ${C_RESET}${C_KEY}s${C_RESET}${C_MUTED} stop  ${C_RESET}${C_KEY}x${C_RESET}${C_MUTED} remove  ${C_RESET}${C_KEY}a${C_RESET}${C_MUTED} all  ${C_RESET}${C_KEY}q${C_RESET}${C_MUTED} quit${C_RESET}"
+  add "  ${C_KEY}↑↓${C_RESET}${C_MUTED} move  ${C_RESET}${C_KEY}⏎${C_RESET}${C_MUTED} open  ${C_RESET}${C_KEY}l${C_RESET}${C_MUTED} read  ${C_RESET}${C_KEY}n${C_RESET}${C_MUTED} new  ${C_RESET}${C_KEY}s${C_RESET}${C_MUTED} stop  ${C_RESET}${C_KEY}x${C_RESET}${C_MUTED} remove  ${C_RESET}${C_KEY}a${C_RESET}${C_MUTED} all  ${C_RESET}${C_KEY}q${C_RESET}${C_MUTED} quit${C_RESET}"
 
   printf '\033[H%s\033[J' "$out"
   unset -f add
@@ -3288,6 +3408,19 @@ agents_board() {
       $'\n'|l|L|s|S|x|X)
         (( AG_N > 0 )) || continue
         local id="${AG_ID[$sel]}"
+        # Reading works for any session with a transcript, terminal ones included;
+        # only opening, stopping and removing are background-only.
+        if [[ "$key" == l || "$key" == L ]]; then
+          away
+          if command -v less >/dev/null 2>&1; then
+            # +G: start at the end, where the latest turn is; scroll up for history.
+            agent_transcript "${AG_SID[$sel]}" true | less -R +G
+          else
+            agent_transcript "${AG_SID[$sel]}" true; printf '\n  press a key '; enable_raw_mode; read_key key || true
+          fi
+          back
+          continue
+        fi
         if [[ "${AG_KIND[$sel]}" != background ]]; then
           note="${id} is a terminal session (pid ${AG_PID[$sel]:-?}) — switch to that terminal"
           continue
@@ -3297,15 +3430,6 @@ agents_board() {
             away
             agent_ctl attach "$id" || { printf '\n  press a key '; enable_raw_mode; read_key key || true; }
             back; reload=true
-            ;;
-          l|L)
-            away
-            if command -v less >/dev/null 2>&1; then
-              agent_ctl logs "$id" 2>&1 | less -R
-            else
-              agent_ctl logs "$id" 2>&1; printf '\n  press a key '; enable_raw_mode; read_key key || true
-            fi
-            back
             ;;
           s|S|x|X)
             local verb=stop what="Stop"
@@ -3361,10 +3485,15 @@ RB
 
 # claudius agents [--json] [--all]
 # claudius agents new [--profile P|auto] [--name N] [--worktree W|--no-worktree] <message…>
-# claudius agents attach|logs|stop|rm <id>
+# claudius agents show <id>        — the conversation, readable (any session)
+# claudius agents attach|logs|stop|rm <id>   (logs = raw terminal output)
 cmd_agents() {
   case "${1:-}" in
     attach|open) shift; agent_ctl attach "$@"; return ;;
+    show|read)   shift
+                 agent_find "${1:-}" || return 1
+                 local tty=false; [[ -t 1 ]] && tty=true
+                 agent_transcript "$AG1_SID" "$tty"; return ;;
     logs|log)    shift; agent_ctl logs "$@"; return ;;
     stop|kill)   shift; agent_ctl stop "$@"; return ;;
     rm|remove)   shift; agent_ctl rm "$@"; return ;;
@@ -4103,6 +4232,7 @@ ${C_MUTED}USAGE${C_RESET}
   $prog agents new [--profile P|auto] [--name N] [--worktree W|--no-worktree] <msg>
                              start a background agent (default: the account
                              'next' picks, in a new worktree named after it)
+  $prog agents show <id>     what an agent did: the conversation, readable
   $prog agents attach|logs|stop|rm <id>
                              the same, through the account that owns <id>
   $prog refresh <profile>    renew token if needed & rewrite the usage cache

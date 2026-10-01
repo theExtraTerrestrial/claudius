@@ -223,8 +223,49 @@ has  "and next says why"                       'Every account is at a limit' "$T
 say 'cmd_agents_new'
 check "no message is a usage error"            '[[ "$(cat "$T/rc")" == 2 ]]'
 
-# ── 6. the real home ──────────────────────────────────────────────────────────
-echo "6. the real profile root was never touched"
+# ── 6. the transcript view ────────────────────────────────────────────────────
+echo "6. show: the conversation, readable"
+TD="$H/.claude/projects/-repo-wt"
+mkdir -p "$TD"
+HOME="$REAL_HOME" ruby -rjson -e '
+  big = "x" * 300_000
+  rows = [
+    { "type" => "user", "timestamp" => "2026-10-01T10:00:00Z", "message" => { "role" => "user", "content" => "fix the login timeout" } },
+    { "type" => "user", "isMeta" => true, "timestamp" => "2026-10-01T10:00:01Z", "message" => { "content" => "META-SHOULD-NOT-SHOW" } },
+    { "type" => "user", "timestamp" => "2026-10-01T10:00:02Z", "message" => { "content" => "<system-reminder>REMINDER-SHOULD-NOT-SHOW</system-reminder>" } },
+    { "type" => "assistant", "timestamp" => "2026-10-01T10:00:03Z", "message" => { "content" => [
+      { "type" => "thinking", "thinking" => "THINKING-SHOULD-NOT-SHOW" },
+      { "type" => "text", "text" => "Looking at the auth module first." },
+      { "type" => "tool_use", "name" => "Bash", "input" => { "command" => "npm test -- auth", "description" => "Run the auth specs" } },
+      { "type" => "tool_use", "name" => "Read", "input" => { "file_path" => "/repo/src/auth.ts" } } ] } },
+    { "type" => "user", "timestamp" => "2026-10-01T10:00:04Z", "message" => { "content" => [
+      { "type" => "tool_result", "is_error" => true, "content" => "Exit code 1 timeout exceeded" },
+      { "type" => "tool_result", "content" => "RESULT-SHOULD-NOT-SHOW" } ] } },
+    { "type" => "user", "timestamp" => "2026-10-01T10:00:05Z", "message" => { "content" => [{ "type" => "tool_result", "content" => big }] } },
+    { "type" => "assistant", "isSidechain" => true, "timestamp" => "2026-10-01T10:00:06Z", "message" => { "content" => [{ "type" => "text", "text" => "SIDECHAIN-SHOULD-NOT-SHOW" }] } },
+    { "type" => "user", "timestamp" => "2026-10-01T10:00:07Z", "message" => { "content" => "<command-name>/compact</command-name>" } },
+  ]
+  File.write(ARGV[0], rows.map { |r| JSON.generate(r) }.join("\n") + "\nnot json at all\n")
+' "$TD/aaaa1111-0000-0000-0000-000000000001.jsonl"
+say 'cmd_agents show aaaa1111'
+has   "your message, under 'you'"             'fix the login timeout' "$T/out"
+has   "Claude's reply"                        'Looking at the auth module first.' "$T/out"
+has   "a tool call as one line, by its description" '▸ Bash  Run the auth specs' "$T/out"
+has   "a file tool by its path"               '▸ Read  /repo/src/auth.ts' "$T/out"
+has   "a failed tool call is said"            '✗ Exit code 1 timeout exceeded' "$T/out"
+has   "a slash command shows as itself"       '/compact' "$T/out"
+for x in META REMINDER THINKING RESULT SIDECHAIN; do
+  hasnt "skipped: $x"                         "$x-SHOULD-NOT-SHOW" "$T/out"
+done
+hasnt "a huge tool result is not dumped"      'xxxxxxxxxx' "$T/out"
+hasnt "not a raw terminal capture"            $'\r' "$T/out"
+hasnt "no colour into a pipe"                 $'\e[' "$T/out"
+check "found in a worktree's project dir, by id" '[[ "$(cat "$T/rc")" == 0 ]]'
+say 'cmd_agents show bbbb2222'
+has   "no transcript yet: said, not an error" 'No transcript for session' "$T/out"
+
+# ── 7. the real home ──────────────────────────────────────────────────────────
+echo "7. the real profile root was never touched"
 check "real ~/.claude-profiles unchanged" \
   '[[ "$(ls -A "$REAL_HOME/.claude-profiles" 2>/dev/null | sort)" == "$REAL_BEFORE" ]]'
 check "no sandbox link into the real home" "[[ -z \"\$(find '$T' -lname '$REAL_HOME/.claude/*' 2>/dev/null)\" ]]"

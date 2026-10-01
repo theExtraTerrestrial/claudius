@@ -223,9 +223,16 @@ reading an agent has to go through the account that owns it.
 
 Agents that need you sort first; the second line is what the agent last reported,
 so you can review it without opening it. `⏎` opens one (through its own account),
-`l` reads its recent output, `n` starts a new one, `s` stops, `x` removes (and its
-worktree, when that is safe), `a` shows the older finished ones. The board
-refreshes itself every few seconds.
+`n` starts a new one, `s` stops, `x` removes (and its worktree, when that is
+safe), `a` shows the older finished ones. The board refreshes itself every few
+seconds.
+
+`l` reads what an agent did: its conversation from the transcript, your messages,
+Claude's replies, one line per tool call and the ones that failed, opened at the
+latest turn. It works for terminal sessions too, so you can catch up on one
+without switching to it. (`claudius agents show <id>` prints the same;
+`agents logs <id>` is Claude Code's raw terminal capture, which is not meant for
+reading.)
 
 `n` opens on the list of your profiles, with email and room left, in `next`'s
 order with the cursor on the first; pick one with ↑↓ (an account at its limit is

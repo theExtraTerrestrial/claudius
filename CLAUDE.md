@@ -200,8 +200,8 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   `.usage.log` format, `usage_history_json` or `next_json`. Throwaway `HOME`,
   every sample written by the test, no API call — the rate segmentation and the
   pruning rules are the parts that would otherwise fail silently and slowly.
-- Run `bash tests/agents.sh` (43 assertions, ~15s) after any change to
-  `agents_data`, `agent_find`, `agent_ctl`, `cmd_agents` or `cmd_agents_new`.
+- Run `bash tests/agents.sh` (59 assertions, ~15s) after any change to
+  `agents_data`, `agent_transcript`, `agent_find`, `agent_ctl`, `cmd_agents` or `cmd_agents_new`.
   `claude` is a stub on PATH serving a fixture listing and logging
   `<config dir>|argv…`, so routing to the owning account is asserted, not assumed.
 - Verify TUI changes by hand — there is no suite for the TUI. It shows no
