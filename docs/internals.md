@@ -144,7 +144,7 @@ dangerous operation in the project, free to drift from the first.
 
 `tests/share.sh` covers the sharing and wiring logic, which is where the data-loss
 risk lives: link targets, idempotence, the `settings.json` merge, the
-`projects`-key sync, collision handling and refusals, and that `rm -rf` on a wired
+`projects`-key sync, collision handling, the files kept per config dir, and that `rm -rf` on a wired
 profile leaves the shared pool intact.
 
 Nothing covers the TUI or the dashboard. The TUI needs a pty and raw-mode input;
@@ -201,6 +201,29 @@ A consequence worth knowing when working on `remove`: deleting a wired profile i
 safer than it looks. The pooled directories are symlinks, so `rm -rf` on the
 profile takes the links and leaves the pool intact. What is actually lost is the
 profile's token and identity, and the account can be re-added.
+
+### Why the merge does not ask
+
+It used to. A profile with its own data in the way got a description of the
+merge and a `[y/N]`, and a non-interactive run refused outright. That guarded
+nothing: the merge cannot lose data (a directory only gains what the pool lacks,
+history lines are appended with duplicates skipped, and the profile's own copy is
+always set aside as `<name>.pre-share.bak`). What it did do was interrupt launch
+after launch, because Claude Code recreates some files per config dir: it writes a
+new file and renames it over the old one, which replaces a symlink with a plain
+file, so the same "collision" reappeared every session. A refusal also meant a
+scripted `run`, such as an agent started from `claudius agents`, simply failed.
+
+So the merge proceeds and says what it folded in, in one line on stderr. The
+files that are rewritten that way are treated as per config dir instead
+(`share_is_per_config_dir`), and two of them are per account rather than merely
+per dir: `policy-limits.json` and `remote-settings.json` hold the signed-in
+account's organisation policy, so a shared copy applied one org's policy to
+another account. Links to those made by an older claudius are removed on sight.
+For a file nobody has listed yet, the backup is the evidence: one that was set
+aside once and is back as a plain file is left the profile's own, rather than
+merged again every session. Directories never take that path; a directory coming
+back is real data moving and is merged again.
 
 ## Credential scope on macOS
 

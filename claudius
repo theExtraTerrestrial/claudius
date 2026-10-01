@@ -1053,9 +1053,28 @@ remove_profile() {
 # It's a DENYLIST, not an allowlist: whatever Claude Code adds to ~/.claude in
 # future is shared automatically rather than silently missing from run sessions.
 
+# Files Claude Code keeps per config dir and rewrites itself. Isolated like the
+# rest of share_is_isolated, and also UNLINKED where an older claudius linked them
+# (see wire_profile_sharing) — for the first group a link is not just futile but
+# wrong.
+share_is_per_config_dir() {
+  case "$1" in
+    # Per-ACCOUNT state fetched for whoever is signed in: the organisation's
+    # policy limits and its remote managed settings. Shared, one account's org
+    # policy would be applied to another.
+    policy-limits.json|policy-limits.json.*|remote-settings.json|remote-settings.json.*) return 0 ;;
+    # Caches and updater state, written as a new file renamed over the old one —
+    # which replaces a symlink with a plain file, so a link never survives a
+    # session and the file would only be merged all over again next time.
+    *-cache.json|.last-update-result.json) return 0 ;;
+  esac
+  return 1
+}
+
 # Entries that are NEVER linked: they define which account this is, or they are
 # per-process runtime state that two sessions must not share.
 share_is_isolated() {
+  share_is_per_config_dir "$1" && return 0
   case "$1" in
     # Identity + token — the entire reason profiles exist.
     .credentials.json|.claude.json|claude.json) return 0 ;;
@@ -1084,24 +1103,6 @@ share_entries() {
     done )
 }
 
-# What a merge would actually do to this entry, for the confirmation prompt. Kept
-# in step with the act loop in wire_profile_sharing — a prompt that misdescribes
-# the work is worse than no prompt.
-share_merge_note() {
-  local own="$1" pool="$2"
-  if [[ -d "$own" ]]; then
-    local n=0
-    n="$(share_missing_children "$own" "$pool" | wc -l | tr -d ' ')"
-    printf '%s item(s) copied into the pool' "$n"
-  elif [[ ! -e "$pool" ]]; then
-    printf 'moved into the pool'
-  elif [[ "$own" == *.jsonl ]]; then
-    printf 'new lines appended (duplicates skipped)'
-  else
-    printf 'kept as a backup only (the pool already has one)'
-  fi
-}
-
 # Children of $1 that the pool $2 does not already have.
 share_missing_children() {
   ( shopt -s nullglob dotglob
@@ -1114,16 +1115,26 @@ share_missing_children() {
 }
 
 # ── Plan / act ────────────────────────────────────────────────────────────────
-# Planning is strictly read-only so the confirmation prompt can describe exactly
-# what will happen before anything on disk moves.
+# Planning is strictly read-only, so what a wiring will do is known — and can be
+# reported — before anything on disk moves.
 SHARE_PLAN_LINK=()     # nothing in the way — just symlink (silent)
 SHARE_PLAN_RELINK=()   # a symlink pointing somewhere else — repoint (silent)
-SHARE_PLAN_MERGE=()    # REAL data in the profile — merge + set aside (confirm)
-SHARE_PLAN_NOTE=()     # parallel to SHARE_PLAN_MERGE
+SHARE_PLAN_MERGE=()    # REAL data in the profile — merge + set aside
+
+# Whether share_set_aside has already moved a copy of this path out of the way
+# (as <path>.pre-share.bak or <path>.pre-share.<n>.bak).
+share_was_set_aside() {
+  ( shopt -s nullglob
+    local b
+    for b in "$1".pre-share.bak "$1".pre-share.*.bak; do
+      [[ -e "$b" ]] && exit 0
+    done
+    exit 1 )
+}
 
 share_plan() {
   local dir="$1"
-  SHARE_PLAN_LINK=(); SHARE_PLAN_RELINK=(); SHARE_PLAN_MERGE=(); SHARE_PLAN_NOTE=()
+  SHARE_PLAN_LINK=(); SHARE_PLAN_RELINK=(); SHARE_PLAN_MERGE=()
   [[ -d "$CLAUDE_DIR" ]] || return 0
   local entry src dst
   while IFS= read -r entry; do
@@ -1134,9 +1145,14 @@ share_plan() {
     if [[ -L "$dst" ]]; then
       [[ "$(readlink "$dst" 2>/dev/null)" == "$src" ]] && continue
       SHARE_PLAN_RELINK+=("$entry")
+    elif [[ -f "$dst" ]] && share_was_set_aside "$dst"; then
+      # Linked once already, and back as a plain file: the CLI writes this one
+      # per config dir, so a link cannot hold. Leave it the profile's own rather
+      # than asking the same question every session. Directories never take
+      # this path — a merge into one is real data moving, and asking stays right.
+      continue
     elif [[ -e "$dst" ]]; then
       SHARE_PLAN_MERGE+=("$entry")
-      SHARE_PLAN_NOTE+=("$(share_merge_note "$dst" "$src")")
     else
       SHARE_PLAN_LINK+=("$entry")
     fi
@@ -1200,11 +1216,10 @@ share_set_aside() {
 }
 
 # Wire one profile to the shared pool. Idempotent: re-running only fixes what is
-# missing or mis-pointed. $2 = how to handle a merge that would move real data:
-# true = prompt, false = refuse (non-interactive), auto = proceed (only for a
-# profile this same command just created, whose contents are seconds-old login
-# scaffolding rather than anything the user made).
-# Returns nonzero only when a merge was needed and could not be confirmed.
+# missing or mis-pointed, and real data in the way is merged without asking (see
+# below). $2 only decides whether a merge is mentioned: auto = silently, for a
+# profile this same command just created; anything else = one line on stderr.
+# Returns nonzero only when the profile does not exist.
 wire_profile_sharing() {
   local name="$1" interactive="${2:-true}"
   local dir="$PROFILE_ROOT/$name"
@@ -1213,30 +1228,33 @@ wire_profile_sharing() {
 
   share_plan "$dir"
 
-  local n_merge=${#SHARE_PLAN_MERGE[@]} i
-  if (( n_merge > 0 )) && [[ "$interactive" != auto ]]; then
-    # Real data would move. Describe it precisely, then ask — a symlink is
-    # reversible, a merged history is not.
-    printf "\n%s'%s' has its own session data.%s Wiring it for sharing will:\n" \
-      "$C_AMBER" "$name" "$C_RESET"
-    for (( i = 0; i < n_merge; i++ )); do
-      printf '  %s•%s %-18s %s\n' "$C_MUTED" "$C_RESET" \
-        "${SHARE_PLAN_MERGE[$i]}" "${SHARE_PLAN_NOTE[$i]}"
-    done
-    printf '  %sthen each is set aside as <name>.pre-share.bak and replaced with a\n' "$C_MUTED"
-    printf '  symlink into %s%s\n' "$CLAUDE_DIR" "$C_RESET"
-    if [[ "$interactive" != true ]]; then
-      printf '\n%sRefusing to move data without confirmation.%s Run `%s link %s` in a terminal first.\n' \
-        "$C_AMBER" "$C_RESET" "$(basename "$0")" "$name" >&2
-      return 1
+  # Undo links an older claudius made to files that must be per config dir. Only
+  # the link goes — never the pool's file — and the CLI fetches or rebuilds the
+  # profile's own copy on its next start.
+  local e
+  while IFS= read -r e; do
+    [[ -n "$e" ]] || continue
+    share_is_per_config_dir "$e" || continue
+    if [[ -L "$dir/$e" && "$(readlink "$dir/$e" 2>/dev/null)" == "$CLAUDE_DIR/$e" ]]; then
+      rm -f "$dir/$e"
     fi
-    printf '\nProceed? %s[y/N]%s ' "$C_MUTED" "$C_RESET"
-    local reply=""
-    read -r reply || reply=""
-    case "$reply" in
-      y|Y|yes|YES) ;;
-      *) echo "Cancelled."; return 1 ;;
-    esac
+  done < <(share_entries)
+
+  local n_merge=${#SHARE_PLAN_MERGE[@]} i
+  # No confirmation. Sharing is what a profile is for, and the merge cannot lose
+  # anything: a directory only gains what the pool lacks, history lines are
+  # appended with duplicates skipped, and the profile's own copy is always set
+  # aside as <name>.pre-share.bak rather than deleted. A question here bought no
+  # safety and interrupted every launch on which Claude Code had recreated a file.
+  # Said once, on stderr (stdout may be a session's own output), and not at all
+  # for a profile `add` just created, whose contents are seconds-old scaffolding.
+  if (( n_merge > 0 )) && [[ "$interactive" != auto ]]; then
+    local what=""
+    for (( i = 0; i < n_merge; i++ )); do
+      what+="${what:+, }${SHARE_PLAN_MERGE[$i]}"
+    done
+    printf "%s·%s %sshared %s's own %s into the pool (originals kept as *.pre-share.bak)%s\n" \
+      "$C_MUTED" "$C_RESET" "$C_DIM" "$name" "$what" "$C_RESET" >&2
   fi
 
   if (( n_merge > 0 )); then

@@ -161,10 +161,18 @@ linked, because they must stay per-profile files:
 
 Wiring happens on a profile's first `run` (and at `add` time for new profiles).
 `claudius link <profile>` does it on demand and is idempotent. If a profile
-already has its own `projects/` or `history.jsonl`, claudius **asks first**, then
-folds it into the pool, sets the old copy aside as `<name>.pre-share.bak`, and
-replaces it with a symlink — nothing is deleted, and a non-interactive run
-refuses rather than moving data unasked.
+already has its own `projects/` or `history.jsonl`, claudius folds it into the
+pool **without asking**, sets the old copy aside as `<name>.pre-share.bak`, and
+replaces it with a symlink, saying so in one line. Nothing is deleted, so there
+is nothing to confirm.
+
+A few files are never shared, because Claude Code keeps them per config dir:
+`policy-limits.json` and `remote-settings.json` belong to the signed-in account's
+organisation, and caches such as `gh-pr-status-cache.json` are rewritten in place,
+which no symlink survives. A link an older claudius made to one of these is
+removed on the next `run` (the link only; the pool's file stays). Any other file
+that was shared once and comes back as a plain file is left the profile's own,
+rather than being merged again every session.
 
 Sharing is unconditional — there is no opt-out flag, because separating your
 work is not what multiple accounts are for. If you need a genuinely private

@@ -157,7 +157,7 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 
 ## Tests
 
-- Run `bash tests/share.sh` (97 assertions, ~20s) before any change to
+- Run `bash tests/share.sh` (110 assertions, ~20s) before any change to
   `wire_profile_sharing`, `merge_profile_settings`, `sync_profile_projects_key`,
   `link` or `run`.
 - Run `bash tests/run-scope.sh` (53 assertions, 51 off macOS) before any change to

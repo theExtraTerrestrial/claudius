@@ -130,17 +130,15 @@ mkdir -p "$P/projects/-repo-z"; : > "$P/projects/-repo-z/zzz.jsonl"
 mkdir -p "$P/projects/-repo-a"; : > "$P/projects/-repo-a/own.jsonl"
 printf '{"display":"global one"}\n{"display":"profile only"}\n' > "$P/history.jsonl"
 
-out="$(inhome "$H" 'wire_profile_sharing work false; echo "rc=$?"' 2>&1)"
-check "non-interactive refuses"         '[[ "$out" == *"rc=1"* ]]'
-check "refusal names the fix"           '[[ "$out" == *"link work"* ]]'
-check "nothing moved on refusal"        "[[ -d '$P/projects/-repo-z' && ! -L '$P/projects' ]]"
-check "plan lists the entries"          '[[ "$out" == *projects* && "$out" == *history.jsonl* ]]'
-
-out="$(inhome "$H" 'printf "n\n" | wire_profile_sharing work true; echo "rc=$?"' 2>&1)"
-check "declining leaves data alone"     "[[ \"\$out\" == *'rc=1'* && -d '$P/projects/-repo-z' ]]"
-
-out="$(inhome "$H" 'printf "y\n" | wire_profile_sharing work true; echo "rc=$?"' 2>&1)"
-check "confirming succeeds"             '[[ "$out" == *"rc=0"* ]]'
+# Sharing is what a profile is for, and the merge loses nothing, so there is no
+# question to answer: interactive or not, it proceeds and says what it folded in.
+# The `n` on stdin is there to prove nothing reads it — a leftover prompt would
+# swallow it and decline.
+out="$(inhome "$H" 'printf "n\n" | { wire_profile_sharing work true; echo "rc=$?"; read -r left; echo "left=$left"; }' 2>&1)"
+check "merges without asking"           '[[ "$out" == *"rc=0"* ]]'
+check "stdin is never read"             '[[ "$out" == *"left=n"* ]]'
+check "no question is put"              '[[ "$out" != *"Proceed?"* && "$out" != *"[y/N]"* ]]'
+check "says what it shared"            '[[ "$out" == *"shared work"* && "$out" == *projects* && "$out" == *history.jsonl* ]]'
 check "projects now a symlink"          "[[ -L '$P/projects' ]]"
 check "own slug folded into pool"       "[[ -f '$H/.claude/projects/-repo-z/zzz.jsonl' ]]"
 check "pool's own slug not clobbered"   "[[ -f '$H/.claude/projects/-repo-a/aaa.jsonl' && ! -f '$H/.claude/projects/-repo-a/own.jsonl' ]]"
@@ -334,8 +332,51 @@ check "pool agents SURVIVE"             "[[ -d '$H/.claude/agents' ]]"
 check "pool CLAUDE.md SURVIVES"         "[[ -f '$H/.claude/CLAUDE.md' ]]"
 check "global creds SURVIVE"            "[[ -f '$H/.claude/.credentials.json' ]]"
 
-# ── 13. real ~/.claude untouched ──────────────────────────────────────────────
-echo "13. the real ~/.claude was never touched"
+# ── 13. files Claude Code keeps per config dir ────────────────────────────────
+# Each of these came back as a plain file after being linked, on every session,
+# and asked the same question each time. Two are per ACCOUNT: an org's policy
+# limits and remote settings must never be one shared file.
+echo "13. per-config-dir files: never linked, never asked about"
+H="$T/h16"; mkhome "$H"; mkprofile "$H" work "work@example.com"
+P="$H/.claude-profiles/work"
+for f in policy-limits.json policy-limits.json.stamp.json remote-settings.json \
+         gh-pr-status-cache.json .last-update-result.json; do
+  printf '{"pool":true}\n' > "$H/.claude/$f"
+done
+printf '{"mine":true}\n' > "$P/gh-pr-status-cache.json"
+printf '{"mine":true}\n' > "$P/policy-limits.json.stamp.json"
+# Links an older claudius made, which a run must now take back.
+ln -s "$H/.claude/policy-limits.json" "$P/policy-limits.json"
+ln -s "$H/.claude/remote-settings.json" "$P/remote-settings.json"
+ln -s "$H/.claude/.last-update-result.json" "$P/.last-update-result.json"
+out="$(inhome "$H" 'wire_profile_sharing work false; echo "rc=$?"' 2>&1)"
+check "nothing to merge, nothing said"  '[[ "$out" == "rc=0" ]]'
+check "own cache stays the profile's"   "[[ ! -L '$P/gh-pr-status-cache.json' ]] && grep -q mine '$P/gh-pr-status-cache.json'"
+check "own policy stamp stays its own"  "[[ ! -L '$P/policy-limits.json.stamp.json' ]] && grep -q mine '$P/policy-limits.json.stamp.json'"
+check "no backup made of them"          "[[ -z \"\$(ls '$P' | grep 'cache.json.pre-share\\|stamp.json.pre-share')\" ]]"
+for f in policy-limits.json remote-settings.json .last-update-result.json; do
+  check "old link removed: $f"          "[[ ! -e '$P/$f' && ! -L '$P/$f' ]]"
+  check "pool copy intact: $f"          "grep -q pool '$H/.claude/$f'"
+done
+check "absent ones are not linked"      "[[ ! -e '$P/policy-limits.json' ]]"
+
+# Anything else that was linked once and came back as a file is the same story
+# for a file this list does not know yet: left the profile's own, not re-asked.
+printf 'x\n' > "$H/.claude/some-future-state.json"
+printf 'mine\n' > "$P/some-future-state.json"
+inhome "$H" 'wire_profile_sharing work false' >/dev/null 2>&1
+check "first time: shared as usual"     "[[ -L '$P/some-future-state.json' && -f '$P/some-future-state.json.pre-share.bak' ]]"
+rm "$P/some-future-state.json"; printf 'recreated\n' > "$P/some-future-state.json"
+out="$(inhome "$H" 'wire_profile_sharing work false; echo "rc=$?"' 2>&1)"
+check "recreated: left alone, silently" "[[ \"\$out\" == 'rc=0' && ! -L '$P/some-future-state.json' ]] && grep -q recreated '$P/some-future-state.json'"
+check "no second backup piled up"       "[[ ! -e '$P/some-future-state.json.pre-share.2.bak' ]]"
+# A directory that comes back is real data moving, and is merged again.
+rm "$P/projects"; mkdir -p "$P/projects/-repo-n"; : > "$P/projects/-repo-n/n.jsonl"
+inhome "$H" 'wire_profile_sharing work false' >/dev/null 2>&1
+check "a directory is still merged"     "[[ -L '$P/projects' && -f '$H/.claude/projects/-repo-n/n.jsonl' ]]"
+
+# ── 14. real ~/.claude untouched ──────────────────────────────────────────────
+echo "14. the real ~/.claude was never touched"
 check "no test symlinks into real home" "[[ -z \"\$(find '$T' -lname '$REAL_HOME/.claude/*' 2>/dev/null)\" ]]"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
