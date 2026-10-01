@@ -3105,81 +3105,127 @@ agents_render() {
   unset -f add
 }
 
-# The "new agent" form: two typed lines, then a confirm screen where the account
-# and the worktree are picked with keys rather than typed. Returns 0 when an agent
-# was dispatched, 1 when cancelled.
+# The "new agent" form. It opens on the account list — choosing who does the work
+# is the first decision, so it is the first thing on screen rather than something
+# found after typing — then the task and message are typed under it, and a last
+# screen shows everything with the account and the worktree still changeable.
+# Returns 0 when an agent was dispatched, 1 when cancelled.
 agents_new_dialog() {
-  local name msg
-  disable_raw_mode
-  clear_screen; show_cursor
-  printf '\n  %sNew agent%s   %s(empty task cancels)%s\n\n' "$C_TITLE" "$C_RESET" "$C_MUTED" "$C_RESET"
-  IFS= read -r -e -p "  task     " name || name=""
-  [[ -n "$name" ]] || { enable_raw_mode; return 1; }
-  IFS= read -r -e -p "  message  " msg || msg=""
-  [[ -n "$msg" ]] || msg="$name"
-
-  local accs=() whys=() line
+  # Every profile, in `next`'s order — so the first row, where the cursor starts,
+  # is the one with the most room left. An account at its limit is still listed
+  # and still selectable (it is your call), just dimmed and saying when it clears.
+  local accs=() whys=() oks=() mails=() line
   while IFS= read -r line; do
-    accs+=("${line%%"$AG_US"*}")
-    local rest="${line#*"$AG_US"}"
+    local nm="${line%%"$AG_US"*}" rest="${line#*"$AG_US"}"
+    accs+=("$nm")
     whys+=("${rest%%"$AG_US"*}")
+    oks+=("${rest##*"$AG_US"}")
+    mails+=("$(profile_account_email "$nm" 2>/dev/null || true)")
   done < <(agent_accounts)
   if (( ${#accs[@]} == 0 )); then
+    clear_screen
     printf '\n  %sNo profiles yet — add one first: %s add%s\n' "$C_AMBER" "$(basename "$0")" "$C_RESET"
-    sleep 2; enable_raw_mode; return 1
+    sleep 2; return 1
   fi
 
-  local top branch="" use_wt=false slug
+  local top branch="" use_wt=false slug=""
   top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -n "$top" ]]; then
     branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     use_wt=true
   fi
+
+  local ai=0 key name="" msg="" nl=$'\n' clr=$'\033[K' n=${#accs[@]}
+
+  # step: account | type | confirm
+  form() {
+    local step="$1" o="" j row
+    o+="$clr$nl  ${C_TITLE}New agent${C_RESET}   ${C_MUTED}in ${top:-$(pwd)}${C_RESET}$clr$nl$clr$nl"
+    o+="  ${C_MUTED}account${C_RESET}$clr$nl"
+    for (( j = 0; j < n; j++ )); do
+      row="$(pad_to 14 "${accs[$j]}") $(pad_to 30 "${mails[$j]:-}") ${whys[$j]}"
+      if (( j == ai )); then
+        o+="    ${C_SEL}$(pad_to 86 "${GLYPH_POINTER} ${row}")${C_RESET}$clr$nl"
+      elif [[ "${oks[$j]}" == 1 ]]; then
+        o+="      ${row}$clr$nl"
+      else
+        o+="      ${C_MUTED}${row}${C_RESET}$clr$nl"
+      fi
+    done
+    [[ "${oks[$ai]}" == 1 ]] \
+      || o+="    ${C_AMBER}${accs[$ai]} is at its limit — the agent will stall until it clears${C_RESET}$clr$nl"
+    o+="$clr$nl"
+    if [[ "$step" == confirm ]]; then
+      local wt_line
+      if [[ -z "$top" ]]; then
+        wt_line="${C_MUTED}none — not a git repository${C_RESET}"
+      elif [[ "$use_wt" == true ]]; then
+        wt_line="new worktree ${C_BOLD}${slug}${C_RESET}  ${C_MUTED}own checkout, branched from ${branch:-HEAD}${C_RESET}"
+      else
+        wt_line="this checkout  ${C_MUTED}shares ${branch:-HEAD} with whatever else works here${C_RESET}"
+      fi
+      o+="  ${C_MUTED}task     ${C_RESET}$(trunc 80 "$name")$clr$nl"
+      o+="  ${C_MUTED}message  ${C_RESET}$(trunc 80 "$msg")$clr$nl"
+      o+="  ${C_MUTED}worktree ${C_RESET}${wt_line}$clr$nl$clr$nl"
+      o+="  ${C_KEY}↑↓${C_RESET}${C_MUTED} account  ${C_RESET}"
+      [[ -n "$top" ]] && o+="${C_KEY}w${C_RESET}${C_MUTED} worktree on/off  ${C_RESET}"
+      o+="${C_KEY}⏎${C_RESET}${C_MUTED} start  ${C_RESET}${C_KEY}esc${C_RESET}${C_MUTED} cancel${C_RESET}$clr$nl"
+    elif [[ "$step" == account ]]; then
+      o+="  ${C_KEY}↑↓${C_RESET}${C_MUTED} choose  ${C_RESET}${C_KEY}⏎${C_RESET}${C_MUTED} next  ${C_RESET}${C_KEY}esc${C_RESET}${C_MUTED} cancel${C_RESET}$clr$nl"
+    else
+      o+="  ${C_MUTED}type the task, then the message (empty message = the task; empty task cancels)${C_RESET}$clr$nl$clr$nl"
+    fi
+    printf '\033[H%s\033[J' "$o"
+  }
+  up()   { ai=$(( (ai + n - 1) % n )); }
+  down() { ai=$(( (ai + 1) % n )); }
+  done_form() { unset -f form up down done_form; }
+
+  # 1. account
+  while true; do
+    hide_cursor; form account
+    read_key key || { done_form; return 1; }
+    case "$key" in
+      $'\e[A'|$'\eOA') up ;;
+      $'\e[B'|$'\eOB') down ;;
+      $'\n') break ;;
+      $'\e'|q|Q) done_form; return 1 ;;
+    esac
+  done
+
+  # 2. task + message, typed with line editing under the chosen account
+  disable_raw_mode; show_cursor
+  form type
+  IFS= read -r -e -p "  task     " name || name=""
+  if [[ -z "$name" ]]; then enable_raw_mode; done_form; return 1; fi
+  IFS= read -r -e -p "  message  " msg || msg=""
+  [[ -n "$msg" ]] || msg="$name"
   slug="$(agent_slug "$name")"
   [[ -n "$slug" ]] || slug="agent-$(date +%H%M%S)"
-
-  local ai=0 key nl=$'\n' clr=$'\033[K'
   enable_raw_mode
+
+  # 3. confirm
   while true; do
-    hide_cursor
-    local wt_line
-    if [[ -z "$top" ]]; then
-      wt_line="${C_MUTED}none — $(pwd) is not a git repository${C_RESET}"
-    elif [[ "$use_wt" == true ]]; then
-      wt_line="‹ new worktree: ${C_BOLD}${slug}${C_RESET} ›  ${C_MUTED}own checkout, branched from ${branch:-HEAD}${C_RESET}"
-    else
-      wt_line="‹ this checkout ›  ${C_MUTED}shares ${branch:-HEAD} with whatever else works here${C_RESET}"
-    fi
-    local o=""
-    o+="$clr$nl  ${C_TITLE}New agent${C_RESET}$clr$nl$clr$nl"
-    o+="  ${C_MUTED}task     ${C_RESET}$(trunc 80 "$name")$clr$nl"
-    o+="  ${C_MUTED}message  ${C_RESET}$(trunc 80 "$msg")$clr$nl"
-    o+="  ${C_MUTED}in       ${C_RESET}${top:-$(pwd)}$clr$nl$clr$nl"
-    o+="  ${C_MUTED}account  ${C_RESET}‹ ${C_BOLD}${accs[$ai]}${C_RESET} ›  ${C_MUTED}${whys[$ai]}${C_RESET}$clr$nl"
-    o+="  ${C_MUTED}worktree ${C_RESET}${wt_line}$clr$nl$clr$nl"
-    o+="  ${C_KEY}←→${C_RESET}${C_MUTED} account  ${C_RESET}"
-    [[ -n "$top" ]] && o+="${C_KEY}w${C_RESET}${C_MUTED} worktree on/off  ${C_RESET}"
-    o+="${C_KEY}⏎${C_RESET}${C_MUTED} start  ${C_RESET}${C_KEY}esc${C_RESET}${C_MUTED} cancel${C_RESET}$clr$nl"
-    printf '\033[H%s\033[J' "$o"
-    read_key key || return 1
+    hide_cursor; form confirm
+    read_key key || { done_form; return 1; }
     case "$key" in
-      $'\e[C'|$'\eOC') ai=$(( (ai + 1) % ${#accs[@]} )) ;;
-      $'\e[D'|$'\eOD') ai=$(( (ai + ${#accs[@]} - 1) % ${#accs[@]} )) ;;
-      w|W) [[ -n "$top" ]] && { [[ "$use_wt" == true ]] && use_wt=false || use_wt=true; } ;;
-      $'\e'|q|Q) return 1 ;;
+      $'\e[A'|$'\eOA') up ;;
+      $'\e[B'|$'\eOB') down ;;
+      w|W) if [[ -n "$top" ]]; then [[ "$use_wt" == true ]] && use_wt=false || use_wt=true; fi ;;
+      $'\e'|q|Q) done_form; return 1 ;;
       $'\n')
         disable_raw_mode; show_cursor
         printf '\n  %sstarting on %s…%s\n\n' "$C_ACCENT" "${accs[$ai]}" "$C_RESET"
         local wt=""; [[ "$use_wt" == true ]] && wt="$slug"
         local rc=0
         agent_new "${accs[$ai]}" "$name" "$wt" "$msg" || rc=$?
+        enable_raw_mode
         if (( rc != 0 )); then
           printf '\n  %scould not start it (exit %d) — press a key%s' "$C_AMBER" "$rc" "$C_RESET"
-          enable_raw_mode; read_key key || true
-          return 1
+          read_key key || true
+          done_form; return 1
         fi
-        enable_raw_mode
-        return 0
+        done_form; return 0
         ;;
     esac
   done

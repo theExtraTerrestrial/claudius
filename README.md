@@ -227,10 +227,13 @@ so you can review it without opening it. `⏎` opens one (through its own accoun
 worktree, when that is safe), `a` shows the older finished ones. The board
 refreshes itself every few seconds.
 
-`n` asks for a task and a first message, then lets you pick the account (←→,
-pre-set to what `next` ranks first) and whether the agent gets **its own
-worktree** (the default inside a repo, named after the task) or works in **this
-checkout** alongside whatever else is on that branch. The same from a script:
+`n` opens on the list of your profiles, with email and room left, in `next`'s
+order with the cursor on the first; pick one with ↑↓ (an account at its limit is
+dimmed but still yours to choose). Then type the task and a first message. The
+last screen shows it all, with the account still changeable, and `w` decides
+whether the agent gets **its own worktree** (the default inside a repo, named
+after the task) or works in **this checkout** alongside whatever else is on that
+branch. The same from a script:
 
 ```
 claudius agents new "fix the login timeout in WS-1600"          # account: auto
