@@ -395,6 +395,26 @@ rm "$P/projects"; mkdir -p "$P/projects/-repo-n"; : > "$P/projects/-repo-n/n.jso
 inhome "$H" 'wire_profile_sharing work false' >/dev/null 2>&1
 check "a directory is still merged"     "[[ -L '$P/projects' && -f '$H/.claude/projects/-repo-n/n.jsonl' ]]"
 
+# ── 13b. a session resumes where it was filed ─────────────────────────────────
+# `--resume` finds a session only from the project dir Claude Code filed it under,
+# so the cwd reported has to be the one that encodes to that dir's name. Claude
+# Code turns EVERY non-alphanumeric into '-', so a worktree named with '_' is
+# filed under a name with '-'; matching only '/' and '.' fell back to the first
+# cwd the transcript mentions, the main checkout, and the resume found nothing.
+echo "13b. sessions --json picks the directory the session was filed under"
+H="$T/h17"; mkhome "$H"
+main="$H/repo"; wt="$H/repo/.claude/worktrees/ws-1514_fix.v2"
+mkdir -p "$wt"
+key="$(printf '%s' "$wt" | sed 's/[^a-zA-Z0-9]/-/g')"
+mkdir -p "$H/.claude/projects/$key"
+sid="0aef439b-9da4-4f4e-b3fe-c75badd1bf34"
+{ printf '{"type":"user","cwd":"%s","message":{"role":"user","content":"start here"}}\n' "$main"
+  printf '{"type":"assistant","cwd":"%s","message":{"role":"assistant","content":"ok"}}\n' "$wt"
+} > "$H/.claude/projects/$key/$sid.jsonl"
+json="$(HOME="$H" ASDF_DATA_DIR="$ASDF_KEEP" bash "$SCRIPT" sessions --json 2>/dev/null)"
+got="$(ruby -rjson -e 'puts((JSON.parse(ARGV[0]).find { |s| s["id"] == ARGV[1] } || {})["cwd"])' "$json" "$sid")"
+check "the worktree, not the checkout it started in" "[[ '$got' == '$wt' ]]"
+
 # ── 14. real ~/.claude untouched ──────────────────────────────────────────────
 echo "14. the real ~/.claude was never touched"
 check "no test symlinks into real home" "[[ -z \"\$(find '$T' -lname '$REAL_HOME/.claude/*' 2>/dev/null)\" ]]"

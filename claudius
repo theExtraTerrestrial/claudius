@@ -2667,10 +2667,13 @@ files.each do |path|
   # no session.
   #
   # So the candidates are checked against the directory name instead. Encoding a
-  # path into that name is exact (every '/' and '.' becomes '-'); only the reverse
-  # is lossy, and the reverse is never attempted here.
+  # path into that name is exact: every character that is not a letter or a
+  # digit becomes '-'. Not just '/' and '.' — a worktree named ws-1514_fix is
+  # filed under ...-ws-1514-fix, and matching only those two sent that session's
+  # resume into the main checkout. Only the reverse is lossy, and the reverse is
+  # never attempted here.
   cands = (head + tail).map { |o| o['cwd'] }.compact.reject(&:empty?).uniq
-  cwd = cands.find { |c| c.gsub(%r{[/.]}, '-') == dirkey } || cands.first
+  cwd = cands.find { |c| c.gsub(/[^a-zA-Z0-9]/, '-') == dirkey } || cands.first
   label, lsrc = label_of(head, tail)
   # `exists` is the difference between a command that works and one that fails on
   # its first clause: a resume has to cd into the project, and directories get
