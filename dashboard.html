@@ -1085,6 +1085,38 @@
   }
   const resetLabel = () => resetMode === "clock" ? "resets at" : "resets in";
 
+  /* The tab title: the active account's reading, for a tab you are not looking
+     at. Numbers first — a crowded tab bar keeps only the start of a title, and
+     the name is the part you already know. A blocked window says when it clears
+     instead, because at the ceiling that is the only fact left. The dot is
+     severity, by the page's own thresholds; an emoji because a title is plain
+     text and the tab bar is where colour reads fastest. Coarse units (no
+     seconds) on purpose: a title that changes every second is noise in a
+     taskbar. Pure — `now` is passed in — so it is tested without a clock. */
+  function tabTitle(p, now){
+    if (!p) return "Claude accounts";
+    const pc = v => v == null ? "—" : v + "%";
+    const left = ep => {
+      const s = Math.max(0, ep - now);
+      if (s < 60) return "<1m";
+      const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600),
+            m = Math.floor(s % 3600 / 60);
+      return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
+    };
+    const full = [[p.u7, p.r7, "7d"], [p.u5, p.r5, "5h"]]
+      .find(([v]) => v != null && v >= BLOCKED);
+    if (full){
+      const [, ep, w] = full;
+      return `⛔ ${w} full${ep && ep > now ? " · clears in " + left(ep) : ""} — ${p.name}`;
+    }
+    const top = Math.max(p.u5 ?? -1, p.u7 ?? -1);
+    const dot = top < 0 ? "⚪" : { ok:"🟢", warn:"🟡", crit:"🔴" }[sevOf(top)];
+    return `${dot} ${pc(p.u5)} · ${pc(p.u7)} — ${p.name}`;
+  }
+  const paintTitle = () => {
+    document.title = tabTitle(activeProfile(), Math.floor(Date.now() / 1000));
+  };
+
   function ago(uts){
     if (!uts) return "never read";
     const d = Math.max(0, Math.floor(Date.now()/1000) - uts);
@@ -1889,7 +1921,7 @@
   /* paintSessions is in here because switching the active account changes the
      shape of every copied command — the active one takes bare `claude`. */
   function renderAll(){
-    renderStage(); paintPal(); paintSessions(); paintAdd();
+    renderStage(); paintPal(); paintSessions(); paintAdd(); paintTitle();
     setAmbient(activeProfile() || PROFILES[0]);
   }
 
@@ -2782,6 +2814,7 @@
 
   /* tick the live countdowns; the other modes are static so skip them */
   setInterval(() => { if (resetMode === "countdown") paintResets(); }, 1000);
+  setInterval(paintTitle, 30000);   /* a blocked title counts down to its reset */
 
   skeleton();
   paintLog();

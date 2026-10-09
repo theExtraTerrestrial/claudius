@@ -86,6 +86,8 @@ pieces = {
              chunk(main, /^  Object\.keys\(LOOKS\)\.forEach/, 'look repair') +
              chunk(main, /^  const cycleLook = /, 'cycleLook'),
   'biases' => main[/^  const BIASES = .*$/],
+  'title'  => main[/^  const BLOCKED = .*$/].to_s + "\n" + main[/^  const sevOf = .*$/].to_s + "\n" +
+              chunk(main, /^  function tabTitle\(/, 'tabTitle'),
 }
 abort 'chunk not found: BIASES' if pieces['biases'].nil?
 pieces.each { |k, v| File.write(File.join(work, "piece-#{k}.js"), v) }
@@ -659,10 +661,31 @@ console.log("17b. the log tail starts on a line, not mid-word");
      T(oneline).length === 600 && T(oneline) === oneline.slice(-600));
 }
 
+console.log("18. the tab title carries the active account's reading");
+{
+  const T = new Function(read("piece-title.js") + "; return tabTitle;")();
+  const now = 1_000_000;
+  const P = o => Object.assign({ name:"work", u5:null, u7:null, r5:null, r7:null }, o);
+  eq("no active account keeps the plain title", T(null, now), "Claude accounts");
+  eq("numbers first, then the name", T(P({ u5:34, u7:41 }), now), "🟢 34% · 41% — work");
+  eq("the dot is the worse window", T(P({ u5:12, u7:63 }), now), "🟡 12% · 63% — work");
+  eq("near the ceiling reads red", T(P({ u5:88, u7:20 }), now), "🔴 88% · 20% — work");
+  eq("a missing window is a dash, not a zero", T(P({ u5:null, u7:7 }), now), "🟢 — · 7% — work");
+  eq("no reading at all is neutral", T(P({}), now), "⚪ — · — — work");
+  eq("a full 5h says when it clears", T(P({ u5:100, u7:50, r5:now + 33 * 60 + 20 }), now),
+     "⛔ 5h full · clears in 33m — work");
+  eq("over 100 is still full", T(P({ u5:104, r5:now + 2 * 3600 + 5 * 60 }), now),
+     "⛔ 5h full · clears in 2h 5m — work");
+  eq("a full 7d wins: it is the longer wait", T(P({ u5:100, u7:100, r5:now + 600, r7:now + 2 * 86400 + 4 * 3600 }), now),
+     "⛔ 7d full · clears in 2d 4h — work");
+  eq("a reset already past is not counted down", T(P({ u5:100, r5:now - 5 }), now), "⛔ 5h full — work");
+  eq("the last minute is not shown as 0m", T(P({ u5:100, r5:now + 30 }), now), "⛔ 5h full · clears in <1m — work");
+}
+
 /* The only async block in the suite — addJSON reads a response — so it takes the
    summary with it rather than letting the tally print before its assertions run. */
 (async () => {
-  console.log("18. a response that is not JSON says what is actually wrong");
+  console.log("19. a response that is not JSON says what is actually wrong");
   {
     freshStorage(); stubDom();
     const J = loadAdd().fns.addJSON;
