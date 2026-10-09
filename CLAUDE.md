@@ -44,6 +44,11 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   `token_expired`). It is what the page offers "sign in again" on, so it is an
   invitation and not a verdict: an expired stored credential may still be
   renewable from its refresh token, and `refresh` stays the first thing to try.
+  For the profile bound to the LIVE account (matched by email, not the active
+  marker), the live `~/.claude` credential counts too: a `/login` inside Claude
+  Code lands only there, and `refresh` adopts it into the profile
+  (`adopt_live_creds`). `list` itself never reads the Keychain, so on macOS that
+  profile reads as expired until the next refresh.
 - `claudius sessions --json` →
   `[{id, cwd, short, exists, dirkey, label, lsrc, branch, mts, size}]`, newest
   first. `cwd`, `short`, `exists`, `label`, `lsrc` and `branch` are nullable — a
@@ -157,7 +162,7 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
 
 ## Tests
 
-- Run `bash tests/share.sh` (110 assertions, ~20s) before any change to
+- Run `bash tests/share.sh` (117 assertions, ~20s) before any change to
   `wire_profile_sharing`, `merge_profile_settings`, `sync_profile_projects_key`,
   `link` or `run`.
 - Run `bash tests/run-scope.sh` (53 assertions, 51 off macOS) before any change to

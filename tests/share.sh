@@ -200,6 +200,26 @@ mkprofile "$H" other2 "other@example.com" expired
 inhome "$H" 'keychain_available() { return 1; }; oauth_refresh_creds() { printf "{\"claudeAiOauth\":{\"accessToken\":\"OTHERTOK\",\"expiresAt\":99999999999999}}\n" > "$1"; return 0; }; run_prepare_token other2' >/dev/null 2>&1
 check "other account left live alone"   "grep -q 'stale-live' '$H/.claude/.credentials.json'"
 
+# A sign-in done inside Claude Code lands only in ~/.claude. The profile bound to
+# that account must stop reading as expired, and refresh must adopt the new copy.
+H="$T/h8b"; mkhome "$H"
+mkprofile "$H" relog "live@example.com" expired
+mkprofile "$H" gone "other@example.com" expired
+json="$(HOME="$H" ASDF_DATA_DIR="$ASDF_KEEP" bash "$SCRIPT" list --json 2>/dev/null)"
+check "list: live account not expired"  "ruby -rjson -e 'exit(JSON.parse(ARGV[0]).find{|p| p[\"name\"]==\"relog\"}[\"expired\"]==false)' '$json'"
+check "list: other account still expired" "ruby -rjson -e 'exit(JSON.parse(ARGV[0]).find{|p| p[\"name\"]==\"gone\"}[\"expired\"]==true)' '$json'"
+check "list stays read-only"            "grep -q 'tok-relog' '$H/.claude-profiles/relog/.credentials.json'"
+out="$(inhome "$H" 'keychain_available() { return 1; }; adopt_live_creds gone; echo "rc=$?"')"
+check "adopt refuses another account"   '[[ "$out" == *"rc=1"* ]]'
+check "  …and leaves it alone"          "grep -q 'tok-gone' '$H/.claude-profiles/gone/.credentials.json'"
+inhome "$H" 'keychain_available() { return 1; }; fetch_usage() { :; }; refresh_profile_usage relog' >/dev/null 2>&1
+check "refresh adopts the new sign-in"  "grep -q '\"live\"' '$H/.claude-profiles/relog/.credentials.json'"
+# A stored copy NEWER than the live one (a run session renewed it) is kept.
+printf '{"claudeAiOauth":{"accessToken":"newer","expiresAt":99999999999999}}\n' \
+  > "$H/.claude-profiles/relog/.credentials.json"
+out="$(inhome "$H" 'keychain_available() { return 1; }; adopt_live_creds relog; echo "rc=$?"')"
+check "adopt never downgrades"          '[[ "$out" == *"rc=1"* ]] && grep -q newer "$H/.claude-profiles/relog/.credentials.json"'
+
 # ── 8. plan is read-only ──────────────────────────────────────────────────────
 echo "8. share_plan does not mutate"
 H="$T/h9"; mkhome "$H"; mkprofile "$H" work "work@example.com"

@@ -376,6 +376,47 @@ sync_profile_creds_from_keychain() {
   return 0
 }
 
+# Pull the LIVE credential into profile $1 when the live session is signed in to
+# the SAME account and holds a later expiry. A sign-in done inside Claude Code
+# itself (`/login`, or the CLI's own re-auth prompt) lands only in the live store
+# — ~/.claude/.credentials.json, or the shared Keychain item on macOS — and the
+# profile's copy was otherwise refreshed only by a switch away (save_current_profile).
+# Until then the profile read as expired and the page kept offering "sign in
+# again" on an account that was working. Its old refresh token may also be dead
+# after a re-login, so adopting is the only way `run` gets a usable one.
+# $2 is the live email when the caller has already resolved it (it costs a
+# `claude auth status` on macOS). Identity is matched by email; never adopts
+# across accounts and never writes the live store.
+adopt_live_creds() {
+  local name="$1" live_email="${2:-}"
+  local dir="$PROFILE_ROOT/$name"
+  local creds="$dir/.credentials.json"
+  [[ -d "$dir" ]] || return 1
+  local prof_email; prof_email="$(profile_account_email "$name")"
+  [[ -n "$prof_email" ]] || return 1
+  if [[ -z "$live_email" ]]; then
+    if keychain_available; then live_email="$(live_account_email)"; else live_email="$(global_identity_email)"; fi
+  fi
+  [[ "$live_email" == "$prof_email" ]] || return 1
+
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/claudius.adopt.XXXXXX")" || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  if keychain_available; then
+    read_keychain_creds_guarded > "$tmp" || { rm -f "$tmp"; return 1; }
+  elif [[ -f "$CLAUDE_DIR/.credentials.json" ]]; then
+    cat "$CLAUDE_DIR/.credentials.json" > "$tmp" || { rm -f "$tmp"; return 1; }
+  else
+    rm -f "$tmp"; return 1
+  fi
+  local have want
+  want="$(creds_expires_at "$tmp")"
+  have="$(creds_expires_at "$creds")"
+  if [[ "$want" == "0" ]] || (( want <= have )); then rm -f "$tmp"; return 1; fi
+  mv "$tmp" "$creds" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$creds" 2>/dev/null || true
+  return 0
+}
+
 # ── Credentials / usage probing ───────────────────────────────────────────────
 # Read the OAuth access token from a credentials file (defaults to the live one).
 get_access_token() {
@@ -674,7 +715,9 @@ refresh_profile_usage() {
     local live pemail; live="$(live_account_email)"; pemail="$(profile_account_email "$name")"
     if [[ -n "$live" && -n "$pemail" && "$pemail" == "$live" ]]; then
       # Same account as the live session — rotating its token would log it out, so
-      # read the fresh token from the Keychain instead of ever refreshing it.
+      # read the fresh token from the Keychain instead of ever refreshing it, and
+      # keep the profile's copy in step with it (see adopt_live_creds).
+      adopt_live_creds "$name" "$live" || true
       ptoken="$(get_access_token || true)"
     else
       # A genuinely different account: safe to refresh directly (its refresh chain
@@ -689,8 +732,13 @@ refresh_profile_usage() {
     fi
   elif [[ "$name" == "$active" && -f "$CLAUDE_DIR/.credentials.json" ]] \
        && ! token_expired "$CLAUDE_DIR/.credentials.json"; then
+    adopt_live_creds "$name" || true
     ptoken="$(get_access_token "$CLAUDE_DIR/.credentials.json" || true)"
   else
+    # Not the marked profile, but possibly the same account signed in afresh in
+    # ~/.claude — take that before rotating a refresh token a re-login may have
+    # already retired.
+    adopt_live_creds "$name" || true
     if token_expired "$creds"; then
       refresh_profile_token "$name" || true
     fi
@@ -2155,10 +2203,16 @@ add_new_profile() {
 # it never probes the API — it only reflects the on-disk .usage cache.
 list_profiles_json() {
   local active; active="$(get_active_profile || true)"
-  ruby - "$PROFILE_ROOT" "$active" <<'RB'
+  ruby - "$PROFILE_ROOT" "$active" "$CLAUDE_DIR/.credentials.json" "$CLAUDE_CONFIG" <<'RB'
 require 'json'
 root = ARGV[0]
 active = ARGV[1].to_s
+live_creds = ARGV[2].to_s
+live_email = begin
+  ((JSON.parse(File.read(ARGV[3]))["oauthAccount"] || {})["emailAddress"] || "").to_s
+rescue
+  ""
+end
 out = []
 (Dir.exist?(root) ? Dir.children(root) : []).sort.each do |name|
   next if name.start_with?('.')
@@ -2179,16 +2233,26 @@ out = []
   # disagree by a hair). It is what the page offers "sign in again" on — an
   # expired stored credential may still be renewable from its refresh token, so
   # this is an invitation, not a verdict, and refresh stays the first thing to
-  # try. On macOS the live account's token is in the Keychain and its file can
-  # lag behind it; that case is untested here and would read as expired early.
+  # try. For the profile signed in to the LIVE account, ~/.claude is part of its
+  # storage: a `/login` inside Claude Code lands there, and the profile's own
+  # copy only catches up on refresh or a switch away (adopt_live_creds). So the
+  # fresher of the two counts. Matched by email, never by the active marker
+  # alone. On macOS the live token is in the Keychain, which this read-only path
+  # does not touch (an access prompt would hang the page); there the profile
+  # reads as expired until the next refresh adopts it.
   expired = true
-  begin
-    c = JSON.parse(File.read(File.join(dir, ".credentials.json")))
-    oauth = c["claudeAiOauth"] || {}
-    sub = oauth["subscriptionType"] || ""
+  sources = [File.join(dir, ".credentials.json")]
+  sources << live_creds if !live_email.empty? && email == live_email
+  sources.each do |path|
+    begin
+      oauth = JSON.parse(File.read(path))["claudeAiOauth"] || {}
+    rescue
+      next
+    end
     exp = oauth["expiresAt"]
-    expired = !(oauth["accessToken"].to_s != "" && exp && exp / 1000.0 > Time.now.to_f + 60)
-  rescue
+    fresh = oauth["accessToken"].to_s != "" && exp && exp / 1000.0 > Time.now.to_f + 60
+    sub = oauth["subscriptionType"] || "" if sub.to_s.empty? || fresh
+    expired = false if fresh
   end
   u5 = u7 = uts = r5 = r7 = nil
   begin
