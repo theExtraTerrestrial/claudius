@@ -309,7 +309,12 @@
   .hero .hfoot .cache{font-family:var(--mono);font-size:10.5px;color:var(--fg-3)}
   .hero .hfoot .fieldname{font-family:var(--mono);font-size:10px;color:var(--fg-3);
     margin-left:auto}
-  .others{display:grid;gap:13px;grid-template-columns:repeat(auto-fit,minmax(236px,1fr))}
+  /* At most three to a row in the 1076px column, two on a medium window, one on
+     a phone. At 236px four fit, and a card that narrow squeezes everything that
+     sits on one line in it — the expired note, the 7d pips, the action row. The
+     min() keeps a phone narrower than 320px from overflowing sideways. */
+  .others{display:grid;gap:13px;
+    grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr))}
   .card{border-radius:14px;padding:12px}
 
   /* ── adding an account ──────────────────────────────────────────────────
