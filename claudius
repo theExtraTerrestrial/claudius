@@ -2684,7 +2684,7 @@ files.each do |path|
   # reads exactly like a profile name in a narrow column.
   short = if cwd.nil? then nil
           elsif cwd == HOME then '~'
-          elsif cwd.start_with?(HOME + '/') then '~' + cwd[HOME.length..]
+          elsif cwd.start_with?(HOME + '/') then '~' + cwd[HOME.length..-1]
           else cwd
           end
   out << {
@@ -2853,7 +2853,7 @@ classify = lambda do |cfg|
   c = real.call(cfg)
   next [nil, true] if c == groot
   if c.start_with?(proot + '/')
-    name = c[(proot.length + 1)..].split('/').first
+    name = c[(proot.length + 1)..-1].split('/').first
     next [name, false]
   end
   [nil, false]
@@ -2894,7 +2894,7 @@ out = rows.map do |r|
   cwd = r['cwd']
   short = if cwd.nil? then nil
           elsif cwd == HOME then '~'
-          elsif cwd.start_with?(HOME + '/') then '~' + cwd[HOME.length..]
+          elsif cwd.start_with?(HOME + '/') then '~' + cwd[HOME.length..-1]
           else cwd
           end
   {

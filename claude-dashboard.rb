@@ -159,7 +159,7 @@ def add_job_public(job)
     url: log[%r{https?://\S+}],
     needs_code: log.include?('Paste code'),
     activated: job[:activate],
-    log: log.length > ADD_LOG_MAX ? log[-ADD_LOG_MAX..] : log,
+    log: log.length > ADD_LOG_MAX ? log[-ADD_LOG_MAX..-1] : log,
     error: job[:error]
   }
 end
