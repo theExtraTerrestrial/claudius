@@ -379,6 +379,9 @@
     border-radius:999px;padding:4px 10px;cursor:pointer;
     display:inline-flex;align-items:center;gap:4px}
   .expnote .relog .ms{font-size:13px}
+  .expnote .relog + .relog{margin-left:0}
+  /* sign-in while refresh is still the first thing to try: same shape, no tint */
+  .expnote .relog.quiet{border-color:var(--line-2);background:transparent;color:var(--fg-2)}
   .hero .expnote{font-size:12px;margin-bottom:14px;padding:8px 11px}
 
   /* ── metrics ────────────────────────────────────────────────────────── */
@@ -1091,6 +1094,12 @@
   /* ═══════════ state ══════════════════════════════════════════════════ */
   let PROFILES = [];            /* active first, then API order */
   let calls = 0, busy = new Set();
+  /* Accounts whose stored token is expired AND a refresh from this page has
+     already failed to renew. `expired` alone cannot tell the two apart: a lapsed
+     access token is routine and its refresh token usually still works, so only a
+     failed try earns the card the words "could not renew". Per page load, by
+     design — a reload is a fresh look, and trying refresh again costs nothing. */
+  const unrenewed = new Set();
   /* There may be no active profile at all — the global ~/.claude can hold an
      account that matches none of them. In that case nothing is crowned. */
   const activeProfile = () => PROFILES.find(p => p.active) || null;
@@ -1279,13 +1288,24 @@
 
      The button is dropped — not disabled — while a sign-in is in flight: the
      sidecar runs one at a time, so a second one is not a thing you can ask for,
-     and a control that exists only to be refused is worse than no control. */
+     and a control that exists only to be refused is worse than no control.
+
+     Two stages, because `expired` is an invitation and not a verdict. Until a
+     refresh has been tried, refresh is the cheap likely fix and takes the action
+     style, with sign-in beside it, quiet, for when you already know better. Once
+     a refresh has failed (unrenewed) the note says so, sign-in is the only way
+     back, and refresh drops out. */
   function expNote(p){
     if (!p.expired) return "";
-    return `<div class="expnote"><span class="ms">key_off</span>signed out — its token
-      expired and cannot be renewed${ADD_LIVE.includes(ADD.state) ? ""
-        : `<button class="relog" data-relog="${esc(p.name)}"><span class="ms">login</span
-          >Sign in again</button>`}</div>`;
+    const dead = unrenewed.has(p.name), n = esc(p.name);
+    const say = dead ? "signed out — refresh could not renew its token"
+                     : "token expired — refresh usually renews it";
+    const renew = dead ? ""
+      : `<button class="relog" data-live="${n}"><span class="ms">refresh</span>Refresh</button>`;
+    const relog = ADD_LIVE.includes(ADD.state) ? ""
+      : `<button class="relog${dead ? "" : " quiet"}" data-relog="${n}"><span class="ms">login</span
+          >Sign in again</button>`;
+    return `<div class="expnote"><span class="ms">key_off</span>${say}${renew}${relog}</div>`;
   }
 
   /* The active account is the one you never have to name — `claude` alone runs
@@ -1649,6 +1669,7 @@
       const relog = addRelog();
       if (d.state === "done"){
         if (relog){
+          unrenewed.delete(d.name);
           log("live", `signed <b>${esc(d.name)}</b> in again`, "");
           toast(`${d.name} is signed in again`, "check");
         } else {
@@ -2081,6 +2102,7 @@
       $("#callTally").textContent = calls;
       if (Array.isArray(data.profiles)) PROFILES = order(data.profiles);
       const p = PROFILES.find(x => x.name === name) || {};
+      unrenewed.delete(name);
       log("live", `<b>${esc(name)}</b> read live — 5h ${p.u5 ?? "—"}% · 7d ${p.u7 ?? "—"}%`);
       busy.delete(name);
       /* the read just appended a sample, so the rate it feeds has moved too */
@@ -2094,6 +2116,7 @@
          list so the card can say that itself and offer the way back — otherwise
          the only account that needs an action looks exactly like the others. */
       try { PROFILES = await getProfiles(); } catch (_){}
+      if ((PROFILES.find(x => x.name === name) || {}).expired) unrenewed.add(name);
       renderAll(); paintResets();
     }
   }
