@@ -1,395 +1,170 @@
+<div align="center">
+
 # claudius
 
-Manage & monitor multiple Claude accounts from one CLI — list profiles and their
-5h/7d usage, switch the active account, and open a localhost dashboard in your
-browser. Standardized on **Ruby** (the only non-Bash dependency) so there's no
-`python3`/`curl` requirement.
+**All your Claude accounts in one place.**<br>
+See every account's limits at a glance, switch in one click, and run several at once.
 
-## Install
+![macOS](https://img.shields.io/badge/macOS-supported-1f2937?logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-supported-1f2937?logo=linux&logoColor=white)
+![WSL](https://img.shields.io/badge/WSL2-supported-1f2937?logo=windows&logoColor=white)
+![deps](https://img.shields.io/badge/dependencies-bash%20%2B%20ruby-1f2937)
+![license](https://img.shields.io/badge/license-MIT-1f2937)
 
-Clone the repo and run the installer (macOS + Linux):
+<img src="docs/img/dashboard.png" alt="The claudius dashboard: the active account large on top, the other accounts as cards below, each with its 5-hour and 7-day usage" width="900">
 
-```bash
-git clone https://github.com/theExtraTerrestrial/claudius.git ~/.claudius && bash ~/.claudius/install.sh
-```
+</div>
 
-Then start a new shell (or `source` your rc) and run `claudius help`.
+## Why
 
-The installer symlinks `claudius` into `~/.local/bin` (override with `--prefix`)
-and adds that dir to your `PATH` if needed. Because it's a symlink to the clone,
-**updates are just a `git pull`** — no reinstall:
+Several Claude accounts mean several sets of limits, and Claude Code shows only
+the one you are signed in to. claudius shows all of them, tells you which one to
+use next, and lets you use any of them without logging out of the others.
 
-```bash
-git -C ~/.claudius pull
-```
+## Highlights
 
-Uninstall:
+- **Every limit at a glance.** 5-hour and 7-day usage for every account, with
+  reset countdowns.
+- **Know before you hit the wall.** A burn rate per account, and the time you
+  will reach 100% if that comes before the reset.
+- **`claudius next` picks for you.** The account with the most room left, in one
+  word, ready for scripts.
+- **Several accounts at once.** `claudius run work` opens a session on `work`
+  without touching the account your other terminals use.
+- **One history across accounts.** Start a session on one account, resume it on
+  another. Agents, commands, skills and `CLAUDE.md` are shared too.
+- **Agents on every account, on one board.** Start, read, open and stop
+  background agents, each through the account it runs on.
+- **Usage tracking costs nothing.** The optional status line records your limits
+  as you work, with no extra API calls.
+- **Sign in from the browser.** Add an account, or sign one in again, from the
+  dashboard.
 
-```bash
-bash ~/.claudius/install.sh --uninstall
-```
-
-## Requirements
-
-- **Ruby** ≥ 2.5 (`sudo apt install ruby` / `brew install ruby`)
-- The **`claude`** CLI on your `PATH`
-- For `claudius serve`: the **`webrick`** gem (`gem install webrick` — it's a
-  separate gem on Ruby 3.0+)
-
-## Usage
-
-```
-claudius                      launch the interactive TUI (default)
-claudius list [--json]        list profiles + cached usage (+ active flag)
-claudius status [--json]      show the active profile's live identity + usage
-claudius next [--explain]     print the account with the most room left
-claudius history [profile] [--json] [--points N]
-                              usage over time: burn rate + when you hit a limit
-claudius refresh <profile>    renew token if needed & rewrite the usage cache
-claudius activate <profile>   switch the global ~/.claude to <profile>
-claudius run [profile] [args] open a claude session in <profile> WITHOUT
-                              switching the global account (no name = pick)
-claudius link <profile>       (re)wire a profile for shared sessions, no launch
-claudius agents [--json] [--all]
-                              board of background agents across every account
-claudius agents new [--profile P|auto] [--name N] [--worktree W|--no-worktree] <msg>
-claudius agents attach|logs|stop|rm <id>
-claudius add [name] [--no-activate]
-                              add a new profile (interactive browser login)
-claudius relogin <profile>    sign a profile back in when its token can no
-                              longer be renewed (keeps the profile as it is)
-claudius serve [--port N] [--open]
-                              run the localhost dashboard (browser tab)
-claudius statusline [--remove] enable (or remove) the shared status line
-claudius help | -h            show this help
-```
-
-`--json` output is the stable contract the dashboard consumes.
-
-## Which account now?
-
-That is the question having several accounts creates, and `next` answers it in
-one word, so it composes:
-
-```bash
-claudius run "$(claudius next)"      # open a session on whichever has most room
-claudius next --explain              # the ranking, and why each account placed
-```
-
-Headroom is the **smaller** of the two windows: 4% left on the 7d is 4% left,
-however empty the 5h looks. Accounts within five points of each other are
-treated as equal — that difference is noise — and the tie goes to the fresher
-reading, then the idler account, then the one already active, because not
-switching is free. An account behind a window at 100% is not a candidate at
-all; an imminent reset is deliberately not credited as headroom, since that
-would hand `run` an account still walled off for the next few minutes. When
-nothing is usable the answer is the wait, not a name: `next` exits 1 and says
-on stderr which account clears first and when.
-
-## Usage over time
-
-`.usage` is one line, overwritten — a snapshot. `.usage.log` beside it is the
-same reading appended over time, which is what makes a **burn rate** and a
-projection possible:
-
-```
-erhards2
-    5h   67%  ▄▄▄▄▅▅▅▅▅                 +51.5%/h    → 100% around 01:20
-    7d   21%  ▂▂▂▂▂▂▂▂▂                 too little history
-```
-
-It costs **no API calls**. The status line is handed this session's live limits
-free on every render, so history accumulates while you work; a sample lands at
-most every two minutes. The file is bounded without the appenders knowing how:
-they only ever add a line, and the reader keeps the last six hours at full
-resolution, thins anything older to one sample per quarter hour, and drops
-everything past eight days.
-
-A rate is measured over the **current** window only, identified by its reset
-epoch — that value sits still inside a window and jumps when the window rolls,
-so it separates them exactly, where guessing from a drop in utilization would
-not. Nothing is claimed without enough history to divide by, and a ceiling that
-lands after the window resets is not reported, because it is not a ceiling you
-will hit.
-
-## Several accounts at once (`run`)
-
-`activate` switches the **one** global account that every `claude` then uses.
-`run` leaves that alone and opens a session **in** a profile, so you can have
-several accounts working at the same time in different terminals:
-
-```bash
-claudius run work                  # interactive session on the 'work' account
-claudius run work --model sonnet    # extra args go straight to `claude`
-claudius run                        # no name → pick from a list
-```
-
-It never touches the global `~/.claude` session, the active-profile marker, or
-your live token. Under the hood it points `CLAUDE_CONFIG_DIR` at the profile's
-own dir and `exec`s `claude`, so signals, exit codes and the TTY behave exactly
-as they do for a bare `claude`. In the TUI, press **`o`** on a profile to do the
-same thing.
-
-### Your work follows you across accounts
-
-A config dir is normally a clean slate — which would mean no agents, no slash
-commands and, worse, **no conversation history**, so `claude -c` / `--resume`
-would come up empty. So `run` wires each profile to **share your global
-`~/.claude`** as one pool:
-
-| shared (symlinked into the profile) | private to each profile |
-| --- | --- |
-| `projects/` — transcripts, so `-c`/`--resume` see sessions from **any** account | `.credentials.json` — the OAuth token |
-| `history.jsonl` — one `↑` prompt history | `.claude.json` — the account identity |
-| `agents/`, `commands/`, `skills/`, `CLAUDE.md`, `plugins/` | `settings.json` — merged, not linked (see below) |
-| session state: `sessions/`, `file-history/`, `plans/`, `tasks/`, … | `.usage`, `backups/`, daemon/lock runtime files |
-
-Because the pool **is** `~/.claude`, a session started by plain `claude`
-participates too — start work under one account and resume it under another.
-
-It's a denylist, so anything Claude Code adds to `~/.claude` in future is shared
-automatically rather than silently missing. Two things are merged rather than
-linked, because they must stay per-profile files:
-
-- **`settings.json`** — global keys (permissions, hooks, env, model defaults)
-  fill any gap on first wiring, while the profile's own keys win, so each keeps
-  its own `statusLine`. Backed up once as `settings.json.claudius-bak`.
-- **the `projects` key of `.claude.json`** — per-repo trust ("do you trust this
-  folder?"), `allowedTools` and project MCP servers are copied across on every
-  launch for paths the profile lacks, so run sessions don't re-prompt. Your
-  `oauthAccount` is never touched.
-
-Wiring happens on a profile's first `run` (and at `add` time for new profiles).
-`claudius link <profile>` does it on demand and is idempotent. If a profile
-already has its own `projects/` or `history.jsonl`, claudius folds it into the
-pool **without asking**, sets the old copy aside as `<name>.pre-share.bak`, and
-replaces it with a symlink, saying so in one line. Nothing is deleted, so there
-is nothing to confirm.
-
-A few files are never shared, because Claude Code keeps them per config dir:
-`policy-limits.json` and `remote-settings.json` belong to the signed-in account's
-organisation, and caches such as `gh-pr-status-cache.json` are rewritten in place,
-which no symlink survives. A link an older claudius made to one of these is
-removed on the next `run` (the link only; the pool's file stays). Any other file
-that was shared once and comes back as a plain file is left the profile's own,
-rather than being merged again every session.
-
-Sharing is unconditional — there is no opt-out flag, because separating your
-work is not what multiple accounts are for. If you need a genuinely private
-config dir, point `CLAUDE_CONFIG_DIR` at a directory claudius doesn't manage.
-
-### macOS
-
-The OAuth token lives in the login Keychain rather than in a file, but Claude Code
-**scopes that Keychain item per config dir** — the service name carries a hash of
-the dir (`Claude Code-credentials-<8 hex>`). So `run` can hand a profile its own
-credential, and concurrent accounts work here too, not just on Linux/WSL.
-
-Which credential a run session gets depends on the account:
-
-| the profile is… | credential | why |
-| --- | --- | --- |
-| the **live** account | the shared live item | one credential for both sessions, so a refresh renews rather than forks it — this is what stops a run session from rotating the live session's single-use refresh token and logging it out |
-| a **different** account | the profile's own item, seeded from its `.credentials.json` | that account's refresh chain is independent, so the session can renew freely |
-
-Two caveats worth knowing:
-
-- It needs **claude 2.1.220 or newer**. Below that, `run` refuses a non-live
-  profile and points you at `activate`, rather than opening the wrong account.
-- If claudius cannot tell which account is live (`claude auth status` unavailable
-  *and* no identity saved for the profile), it refuses rather than guess — the two
-  ways of guessing wrong are "wrong identity" and "logged out".
-
-Because the Keychain is the primary store and wins over the file, a run session's
-refreshed token lands in the profile's own Keychain item and Claude Code deletes
-the plaintext copy. claudius syncs it back when the session exits, and `activate`
-and the usage refresh recover it too, so the profile is never left looking
-credential-less.
-
-## Parallel work (`agents`)
-
-Claude Code runs agents in the background (`claude --bg`), each optionally in its
-own git worktree, and lists them with `claude agents`. Because `run` shares
-`sessions/` and `jobs/` across profiles, that one list already holds the agents of
-**every** account — what it does not say is which account each runs on, and that
-matters: every config dir has its own supervisor, so attaching, stopping or
-reading an agent has to go through the account that owns it.
-
-`claudius agents` is that list made account-aware, as a board:
-
-```
-  Agents   1 need you · 2 working · 3 idle · 4 finished  +6 older
-  next account: erhards2 — 62% left on the 5h
-  ───────────────────────────────────────────────────────────────────
-  ➜ 09161075 maternity leave edge case          erhards*   needs you  44m
-             ↳ Is there a JIRA key for the commit message?
-  ● 3f1c0a92 WS-1600 login timeout              erhards2   working     2m
-             ↳ running the auth specs
-  ✓ 0aef439b create worktree ws-1514            erhards2   done        1d
-             ↳ PR #2461 is open and came through review clean
-```
-
-Agents that need you sort first; the second line is what the agent last reported,
-so you can review it without opening it. `⏎` opens one (through its own account),
-`n` starts a new one, `s` stops, `x` removes (and its worktree, when that is
-safe), `a` shows the older finished ones. The board refreshes itself every few
-seconds.
-
-`l` reads what an agent did: its conversation from the transcript, your messages,
-Claude's replies, one line per tool call and the ones that failed, opened at the
-latest turn. It works for terminal sessions too, so you can catch up on one
-without switching to it. (`claudius agents show <id>` prints the same;
-`agents logs <id>` is Claude Code's raw terminal capture, which is not meant for
-reading.)
-
-`n` opens on the list of your profiles, with email and room left, in `next`'s
-order with the cursor on the first; pick one with ↑↓ (an account at its limit is
-dimmed but still yours to choose). Then type the task and a first message. The
-last screen shows it all, with the account still changeable, and `w` decides
-whether the agent gets **its own worktree** (the default inside a repo, named
-after the task) or works in **this checkout** alongside whatever else is on that
-branch. The same from a script:
-
-```
-claudius agents new "fix the login timeout in WS-1600"          # account: auto
-claudius agents new --profile work --no-worktree "update the changelog"
-```
-
-claudius records nothing for this. Ownership is read back from Claude Code's own
-files: a live supervisor's roster, the job's record of the config dir it was
-dispatched from, an interactive session's environment. A `*` marks an agent on
-the global `~/.claude`, which is whichever account is live. Interactive sessions
-are listed too, marked `[terminal]`; they live in the terminal that started them
-and are not opened from here.
-
-## Dashboard
+## The dashboard
 
 ```bash
 claudius serve --open
 ```
 
-Serves a page on `127.0.0.1` **only** (never the LAN). Mutations shell back into
-the CLI so the terminal and the dashboard always agree, and no account tokens are
-ever included in any API response.
+A local page at `127.0.0.1`. The account you are on gets the large panel; the
+others sit below it as cards. The card marked **use next** is the one
+`claudius next` would pick.
 
-**The global account gets a hero.** Both windows at full size, its usage figure
-and its reset time as equals — because at 12% the percentage is the story and at
-100% only the reset is. The other profiles sit below as compact cards showing the
-5h window plus a five-pip band for the 7d. Press **Use** on one and it flies into
-the hero slot as the switch lands.
+The browser tab shows your current account's usage, so you can keep an eye on
+it from any other tab:
 
-- **Usage and reset are one reading.** Each window shows both figures on one
-  baseline, plus two lanes: how much you've used, and how far through the window
-  you are. The gap between them is your burn rate. When a window hits its ceiling
-  the block gives itself over to one fact — when it clears.
-- **Every profile gets its own animated field**, one of eight pure-CSS
-  backgrounds, and the page's ambient background takes the *active* profile's
-  field. The motion is a reading, not decoration: it speeds up as a limit
-  approaches and **stops dead** at the ceiling. Use the kebab to pin or shuffle a
-  card's style if two land on the same one.
-- **Reading live limits is not free.** Each one spends a small Haiku API call (and
-  may renew a token); the price rides on the control that spends it, and the
-  footer keeps a running tally. **Watch cache** only re-reads the local cache on a
-  30-second ring — that part is free and never calls the API.
-- **The burn rate is named, not just implied.** Under each window, the rate per
-  hour and — when the ceiling arrives before the window clears — roughly when,
-  reddening as it nears. A sparkline beside it carries the shape, on a fixed
-  0–100 scale so a flat 3% week and a flat 90% week never draw the same line.
-  With too little history to divide by, none of it is drawn: empty space beats a
-  half-answer.
-- **One card is chipped `use next`** — the account `claudius next` would pick,
-  ranked by the same rules in the same place, so the page and the terminal can
-  never disagree. When it is the account you are already on, it says so instead.
-- **Adding an account happens here now.** A ghost slot under the cards takes a
-  name, opens the Anthropic sign-in in a new tab, and takes a pasted code if the
-  page shows you one. It runs the same `claudius add` — the sidecar just holds the
-  door open, watches for the credentials to appear, and answers the trailing
-  prompt for you. A sign-in you abandon is cleaned up after ten minutes, and
-  unlike the terminal flow it leaves your global account alone unless you tick the
-  box. The code you paste is written straight to the process and is never logged,
-  echoed, or included in any response.
-- **A signed-out account says so on its card, and offers the way back.** When a
-  token has expired and its refresh token has lapsed too, there is nothing left
-  for `refresh` to renew — the account is signed out, and every other button on
-  the card will fail without saying why. So the card says it, and carries a
-  **Sign in again** button that runs `claudius relogin` through the same panel
-  the sign-in above uses. The profile keeps everything it had — its name, its
-  card style, its usage history, its wiring — and only the credential is
-  replaced. A relogin you cancel or abandon puts the old credential back: the
-  opposite cleanup from an add, which removes what it made.
-- **Hover a countdown to see the date.** Every time on the page is relative —
-  "resets in 3d 11h", "100% at 11:10" — which is the right reading at a glance
-  and a poor one when you are planning around it, because "11:10" does not say
-  which day. Hovering any of them gives the full date and time, with the
-  countdown underneath. The same tooltip serves every control that has something
-  to say about itself, in the page's own type rather than the browser's.
-- **The palette** (the `GLOBAL ·` chip) is one place to switch accounts, read all
-  limits, and set preferences: reset display (**countdown** / **clock** /
-  **total**), colour bias, and contrast intensity. All three are remembered in
-  the browser, along with the card styles, the watch toggle and the session
-  filters.
-- **The log** records everything the page did since you opened it —
-  every live read with its result, every free cache re-read, every switch — each
-  row priced, so the cost history sits beside the tally.
-- The page markup lives in `dashboard.html` (edit it directly); the sidecar reads
-  that file and injects only a CSRF token + the profile root at serve time. Fonts
-  and icons come from Google Fonts, so the page wants a network connection. Its
-  header comment carries the design rules — read them before editing.
+```text
+🟢 34% · 41% — work                    5h · 7d usage, colored by the worse one
+⛔ 5h full · clears in 28m — research   at the limit: when it opens again
+```
 
-The dashboard is a **monitor with a few actions**, not a full front-end: `remove`
-and `statusline` stay CLI-only for now (`add` and `relogin` are not — both drive
-their browser sign-in from the page). See `.scratch/front_end/`.
+### It moves with your usage
 
-## Status line
+Every card has an animated background, and its motion is a reading, not
+decoration. It is calm when there is plenty of room, speeds up and heats up as a
+limit gets close, and stops completely when the limit is reached.
 
-Two windows of usage (5h/7d) with reset countdowns, right in your prompt — and a
-free side effect: it **warms the usage cache** so the dashboard stays current with
-**no extra API calls**. (`claudius refresh` costs one Haiku call per account;
-Claude Code hands the status line this session's live limits for free on every
-render.) Cache warming is keyed off each session's config dir, so parallel sessions
-— the default `~/.claude` plus any `CLAUDE_CONFIG_DIR` profiles — each refresh
-their own profile. Accounts with no open session still need a manual
-`claudius refresh`.
+<img src="docs/img/usage-states.png" alt="Three cards: one calm at 6%, one heating up at 88%, one stopped at its limit" width="840">
 
-**Option A — use the shared status line** (recommended). Shows `[model] · context ·
-5h/7d`, and includes cache warming. It writes `statusLine` into your global
-`~/.claude/settings.json` and every profile's `settings.json` (backing each up
-once, preserving other keys):
+### Make it yours
+
+Open the account menu at the top right to switch accounts, read all limits, or
+change how the page looks. Every card's own **⋮** menu picks its background.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/img/palette.png" alt="The top menu filtered to its appearance settings"></td>
+<td width="50%"><img src="docs/img/card-menu.png" alt="A card's menu with its eight background styles"></td>
+</tr>
+<tr>
+<td><b>Appearance</b> — reset times as a countdown, a clock time or the
+window's total; a neutral, cool or warm tint; and how strong the warning
+colors are.</td>
+<td><b>Card style</b> — eight animated backgrounds per card, or <b>Shuffle</b>.
+The page's own background follows the active account's card.</td>
+</tr>
+</table>
+
+<img src="docs/img/card-styles.png" alt="The eight card styles: Contour, Caustics, Halftone, Ribbon, Fractal zoom, Constellation, Moiré, Orbits" width="900">
+
+<img src="docs/img/contrast.png" alt="The same card in the dusty, standard and punchy contrast settings" width="620">
+
+Your choices are remembered in the browser.
+
+### Pick up any session
+
+Recent sessions from all accounts, searchable by title, path or branch. Copy the
+command to resume one on whichever account you like.
+
+<img src="docs/img/sessions.png" alt="The linked sessions list with titles, projects and branches" width="900">
+
+## In the terminal
+
+`claudius` on its own opens an interactive picker. Everything else is one
+command:
+
+```text
+$ claudius next --explain
+                    5h    7d      burn  why
+→ personal          6%   18%    +1.6/h  82% left on the 7d
+  work             34%   41%    +9.6/h  59% left on the 7d
+  client           88%   63%   +21.8/h  12% left on the 5h · hits it ~12:27
+  research        100%   72%   +24.6/h  at the 5h limit · clears 12:31
+
+$ claudius history client
+client
+    5h   87%  ▁▁▁▁▆▃▄▅▃▄▂▃▆▃▂▃▄▄▅▃▄▅▆▇  +21.8%/h    → 100% around 12:27
+    7d   63%  ▂▂▂▂▃▃▃▃▃▄▄▄▄▅▅▅▅▅▅▅▅▅▅▅  +0.6%/h     → the window clears first
+```
 
 ```bash
-claudius statusline           # enable    (or: bash ~/.claudius/install.sh --statusline)
-claudius statusline --remove  # undo (only removes ours — never a status line you set)
+claudius run "$(claudius next)"   # open a session on the account with most room
+claudius activate work             # make 'work' the account plain `claude` uses
+claudius agents                    # background agents across every account
 ```
 
-**Option B — keep your own status line, take just the cache bonus.** Chain the
-pass-through filter in front of it — it reads the status line JSON, writes the
-cache, and re-emits the JSON unchanged, so you see no difference:
+## Platform support
 
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "node ~/.claudius/statusline-usage-cache.js | <your existing statusline command>"
-  }
-}
+| | Status | Notes |
+| --- | --- | --- |
+| **Linux** | ✅ Supported | Developed and tested here |
+| **WSL2** | ✅ Supported | Same as Linux |
+| **macOS** | ✅ Supported | Works with the login Keychain. Running several accounts at once needs Claude Code 2.1.220 or newer |
+| **Windows** | ➖ Use WSL2 | claudius is a bash script |
+
+Needs **bash 3.2+**, **Ruby 2.5+** and the **`claude`** CLI. The dashboard also
+needs the `webrick` gem (`gem install webrick`). Nothing else: no Python, no
+Node packages, no `jq`.
+
+## Install
+
+```bash
+git clone https://github.com/theExtraTerrestrial/claudius.git ~/.claudius && bash ~/.claudius/install.sh
 ```
 
-Both are best-effort and swallow all errors — cache writing can never slow or break
-your status line. Node ships with Claude Code, so there's nothing to install. Cache
-format is `u5 u7 uts r5 r7` in `~/.claude-profiles/<name>/.usage`, and each reading
-is also appended to `.usage.log` as `ts u5 u7 r5 r7` (at most one sample every two
-minutes) — that log is what `claudius history` and the dashboard's burn rate read.
+Open a new shell, then:
 
-## Files
+```bash
+claudius add work        # sign in an account (opens the browser)
+claudius add personal    # …and another
+claudius serve --open    # open the dashboard
+claudius statusline      # optional: free usage tracking in Claude Code
+```
 
-- `claudius` — the CLI/TUI engine (Bash + embedded Ruby)
-- `claude-dashboard.rb` — the localhost dashboard sidecar (Ruby stdlib only)
-- `dashboard.html` — the dashboard page (HTML/CSS/JS), rendered by the sidecar
-- `statusline.sh` — the shared status line (usage display + free cache warming)
-- `statusline-usage-cache.js` — filter to warm the cache from your own status line
-- `install.sh` — portable installer
-- `tests/share.sh` — sandbox tests for the shared-session wiring (throwaway `HOME`)
-- `tests/dashboard.sh` — the page's own logic, run under node against stubs
-- `tests/dashboard-live.sh` — the page driven in a headless browser, read-only
-- `tests/history.sh` — the burn-rate arithmetic and the ranking (throwaway `HOME`)
-- `tests/add.sh` — the browser add flow, driven against a stub CLI (no real login)
+Update with `git -C ~/.claudius pull`. Uninstall with
+`bash ~/.claudius/install.sh --uninstall`.
+
+## Safe by design
+
+- The dashboard listens on `127.0.0.1` only, never your network.
+- Tokens never appear in the page, the API, logs or errors.
+- Every action on the page goes through the same CLI you use in the terminal.
+- Removing an account never signs you out of Claude Code.
+
+## Learn more
+
+- **[The full guide](docs/guide.md)**: every command, how `next` ranks accounts,
+  sharing sessions, macOS details, agents and the status line.
+- **[Internals](docs/internals.md)**: why it is built the way it is.
+
+MIT licensed.
