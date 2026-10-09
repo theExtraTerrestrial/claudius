@@ -4203,7 +4203,12 @@ cmd_relogin() {
 # and macOS (BSD `readlink` has no -f), so `claudius` can be a symlink on PATH while
 # the dashboard sidecar is still found sitting next to the real script file.
 resolve_script_path() {
-  local src="${BASH_SOURCE[0]}" dir
+  resolve_path "${BASH_SOURCE[0]}"
+}
+
+# The same for any path — `uninstall` asks it whether a PATH entry is this script.
+resolve_path() {
+  local src="$1" dir
   while [[ -h "$src" ]]; do
     dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
     src="$(readlink "$src")"
@@ -4297,6 +4302,161 @@ RB
   fi
 }
 
+# Bring a git-checkout install up to date. The default install symlinks the
+# command at the checkout, so a fast-forward IS the update — nothing to reinstall.
+# Refuses rather than stashes or merges: a dirty tree or a diverged branch is
+# someone's work, and only they know what to keep. git replaces a changed file
+# with a new inode, so the copy of this script bash is reading right now stays
+# intact while the one on disk moves ahead. `--check` fetches and reports only.
+cmd_update() {
+  local check=false
+  case "${1:-}" in
+    --check) check=true ;;
+    "") ;;
+    *) echo "usage: $(basename "$0") update [--check]" >&2; return 2 ;;
+  esac
+
+  local dir top
+  dir="$(dirname "$(resolve_script_path)")"
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git was not found on PATH; it is needed to update a checkout." >&2
+    return 1
+  fi
+  top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -z "$top" || "$(cd -P "$top" && pwd)" != "$dir" ]]; then
+    echo "$dir is not a git checkout — this looks like a --copy install." >&2
+    echo "Update the checkout it was copied from, then run its install.sh --copy again." >&2
+    return 1
+  fi
+  if ! git -C "$dir" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    echo "The checkout at $dir has no upstream branch to update from." >&2
+    return 1
+  fi
+  if [[ -n "$(git -C "$dir" status --porcelain --untracked-files=no)" ]]; then
+    echo "The checkout at $dir has local changes; commit or stash them first." >&2
+    return 1
+  fi
+
+  printf '%sFetching…%s\n' "$C_MUTED" "$C_RESET"
+  git -C "$dir" fetch --quiet || { echo "git fetch failed." >&2; return 1; }
+
+  local behind ahead
+  behind="$(git -C "$dir" rev-list --count 'HEAD..@{u}')"
+  ahead="$(git -C "$dir" rev-list --count '@{u}..HEAD')"
+  if (( behind == 0 )); then
+    printf '%s✓%s Already up to date.\n' "$C_GREEN" "$C_RESET"
+    return 0
+  fi
+  if (( ahead > 0 )); then
+    echo "The checkout at $dir has $ahead local commit(s) the upstream lacks;" >&2
+    echo "it cannot fast-forward. Reconcile it with git yourself." >&2
+    return 1
+  fi
+  if [[ "$check" == true ]]; then
+    printf '%s%s update(s) available:%s\n' "$C_AMBER" "$behind" "$C_RESET"
+    git -C "$dir" log --oneline --no-decorate 'HEAD..@{u}' | sed 's/^/  /'
+    printf '%s  Run %s update to install.%s\n' "$C_MUTED" "$(basename "$0")" "$C_RESET"
+    return 0
+  fi
+
+  local old; old="$(git -C "$dir" rev-parse HEAD)"
+  git -C "$dir" merge --ff-only --quiet '@{u}' || { echo "git merge --ff-only failed." >&2; return 1; }
+  printf '%s✓%s Updated (%s change(s)):\n' "$C_GREEN" "$C_RESET" "$behind"
+  git -C "$dir" log --oneline --no-decorate "$old..HEAD" | sed 's/^/  /'
+  if pgrep -f claude-dashboard.rb >/dev/null 2>&1; then
+    printf '%s  A dashboard is running on the old code — restart it to pick this up.%s\n' \
+      "$C_MUTED" "$C_RESET"
+  fi
+}
+
+# Undo what install.sh and `statusline` did: the command on PATH (symlink or
+# --copy), the copied sidecar files, and our status line in every settings.json.
+# Profiles are KEPT unless --purge: they are signed-in accounts, and an uninstall
+# to reinstall should not cost a sign-in per account. Purging forgets them only —
+# ~/.claude and its live sign-in are never touched (profiles link into it, never
+# the reverse). The checkout is left alone too: it may be someone's working tree.
+cmd_uninstall() {
+  local purge=false yes=false arg
+  for arg in "$@"; do
+    case "$arg" in
+      --purge) purge=true ;;
+      -y|--yes) yes=true ;;
+      *) echo "usage: $(basename "$0") uninstall [--purge] [--yes]" >&2; return 2 ;;
+    esac
+  done
+
+  local self dir
+  self="$(resolve_script_path)"
+  dir="$(dirname "$self")"
+
+  # Every PATH entry that is this script: a symlink resolving to it, or the
+  # script itself when it was copied into a bin dir.
+  local installed=() p cand old_ifs="$IFS"
+  IFS=':'
+  for p in $PATH; do
+    IFS="$old_ifs"
+    [[ -n "$p" ]] || continue
+    for cand in "$p/claudius" "$p/$(basename "$0")"; do
+      [[ -e "$cand" || -L "$cand" ]] || continue
+      [[ "$(resolve_path "$cand")" == "$self" ]] || continue
+      case " ${installed[*]:-} " in *" $cand "*) continue ;; esac
+      installed+=("$cand")
+    done
+  done
+  IFS="$old_ifs"
+
+  echo "This will remove:"
+  if (( ${#installed[@]} > 0 )); then
+    for p in "${installed[@]}"; do echo "  $p"; done
+  else
+    echo "  (no claudius command found on PATH)"
+  fi
+  echo "  the claudius status line, wherever it is set"
+  if [[ "$purge" == true ]]; then
+    printf '  %s%s — every stored profile and its credentials%s\n' "$C_AMBER" "$PROFILE_ROOT" "$C_RESET"
+  fi
+  if [[ "$yes" != true ]]; then
+    printf '%sUninstall claudius?%s [y/N] ' "$C_AMBER" "$C_RESET"
+    local ans; IFS= read -r ans || ans=""
+    if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
+      echo "Cancelled."
+      return 1
+    fi
+  fi
+
+  cmd_statusline --remove >/dev/null || true
+  echo "Removed the status line."
+
+  for p in "${installed[@]:-}"; do
+    [[ -n "$p" ]] || continue
+    if [[ ! -L "$p" ]]; then
+      # A --copy install: its sidecar files sit beside it and go with it.
+      for cand in claude-dashboard.rb dashboard.html; do
+        if [[ -f "$(dirname "$p")/$cand" && ! -L "$(dirname "$p")/$cand" ]]; then
+          rm -f "$(dirname "$p")/$cand" && echo "Removed $(dirname "$p")/$cand"
+        fi
+      done
+    fi
+    rm -f "$p" && echo "Removed $p"
+  done
+
+  if [[ "$purge" == true && -d "$PROFILE_ROOT" ]]; then
+    rm -rf "$PROFILE_ROOT" && echo "Removed $PROFILE_ROOT"
+  fi
+
+  printf '%s✓%s claudius is uninstalled.\n' "$C_GREEN" "$C_RESET"
+  printf '%s  Your live Claude Code sign-in in %s is unchanged.%s\n' "$C_MUTED" "$CLAUDE_DIR" "$C_RESET"
+  if [[ "$purge" != true && -d "$PROFILE_ROOT" ]]; then
+    printf '%s  Profiles kept in %s (use --purge to forget them).%s\n' "$C_MUTED" "$PROFILE_ROOT" "$C_RESET"
+  fi
+  if [[ -d "$dir/.git" ]]; then
+    printf '%s  The source checkout stays at %s — delete it yourself if unwanted.%s\n' \
+      "$C_MUTED" "$dir" "$C_RESET"
+  fi
+  printf '%s  A PATH line the installer added to your shell rc is left in place.%s\n' \
+    "$C_MUTED" "$C_RESET"
+}
+
 cmd_help() {
   local prog; prog="$(basename "$0")"
   cat <<EOF
@@ -4333,6 +4493,10 @@ ${C_MUTED}USAGE${C_RESET}
   $prog serve [--port N] [--open]
                              run the localhost dashboard (browser tab)
   $prog statusline [--remove] enable (or remove) the team status line in Claude Code
+  $prog update [--check]     pull the latest claudius into its checkout
+  $prog uninstall [--purge] [--yes]
+                             remove the command and the status line; --purge
+                             also forgets every stored profile
   $prog help | -h            show this help
 
 ${C_MUTED}RUN vs ACTIVATE${C_RESET}
@@ -4370,6 +4534,11 @@ main() {
   trap cleanup EXIT
   init_colors
   require_ruby
+  # Neither needs the claude CLI, and uninstall must work after it is gone.
+  case "${1:-}" in
+    update)    shift; cmd_update "$@"; return ;;
+    uninstall) shift; cmd_uninstall "$@"; return ;;
+  esac
   require_claude
   ensure_storage
   migrate_profiles

@@ -151,8 +151,9 @@ claudius serve --open    # open the dashboard
 claudius statusline      # optional: free usage tracking in Claude Code
 ```
 
-Update with `git -C ~/.claudius pull`. Uninstall with
-`bash ~/.claudius/install.sh --uninstall`.
+Update with `claudius update`. Uninstall with `claudius uninstall`: it removes
+the command and the status line and keeps your profiles; add `--purge` to
+forget them too. Your Claude Code sign-in is never touched.
 
 ## Safe by design
 

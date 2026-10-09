@@ -209,6 +209,10 @@ Background and reasoning: `docs/internals.md`. Deferred work: `.scratch/`.
   `agents_data`, `agent_transcript`, `agent_find`, `agent_ctl`, `cmd_agents` or `cmd_agents_new`.
   `claude` is a stub on PATH serving a fixture listing and logging
   `<config dir>|argv…`, so routing to the owning account is asserted, not assumed.
+- Run `bash tests/install.sh` (34 assertions, ~4s) after any change to
+  `cmd_update`, `cmd_uninstall` or `resolve_path`. It builds its own git upstream
+  from the working tree's files and runs with `claude` off PATH — uninstall must
+  work after Claude Code is gone, so both commands dispatch before `require_claude`.
 - Verify TUI changes by hand — there is no suite for the TUI. It shows no
   burn rate and no recommendation; that is a gap, not a decision.
 - Do not claim macOS behaviour works. It cannot be tested here; say so.

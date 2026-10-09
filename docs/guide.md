@@ -38,6 +38,10 @@ claudius remove <profile>     delete a stored profile (does not sign you out)
 claudius serve [--port N] [--open]
                               run the localhost dashboard (browser tab)
 claudius statusline [--remove] enable (or remove) the team status line in Claude Code
+claudius update [--check]     pull the latest claudius into its checkout
+claudius uninstall [--purge] [--yes]
+                              remove the command and the status line; --purge
+                              also forgets every stored profile
 claudius help | -h            show this help
 ```
 
