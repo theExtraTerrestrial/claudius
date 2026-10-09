@@ -370,16 +370,20 @@
      limit", which is the one thing this does not mean. Muted and dashed like
      .addcard instead — because that is what it has become, an account that is not
      usable until it is signed in again. */
-  .expnote{display:flex;align-items:center;gap:7px;margin:0 0 10px;padding:6px 9px;
+  .expnote{display:flex;flex-wrap:wrap;align-items:center;gap:6px 7px;margin:0 0 10px;padding:6px 9px;
     border:1px dashed var(--line-2);border-radius:10px;font-size:11px;color:var(--fg-3)}
   .expnote .ms{font-size:14px;flex:none}
-  .expnote .relog{margin-left:auto;flex:none;font:inherit;font-size:11px;font-weight:600;
+  .expnote .relog{flex:none;font:inherit;font-size:11px;font-weight:600;
     border:1px solid color-mix(in srgb,var(--action) 55%,transparent);
     background:color-mix(in srgb,var(--action) 12%,transparent);color:var(--action);
     border-radius:999px;padding:4px 10px;cursor:pointer;
     display:inline-flex;align-items:center;gap:4px}
   .expnote .relog .ms{font-size:13px}
-  .expnote .relog + .relog{margin-left:0}
+  /* Text and buttons are two groups so a narrow card wraps the BUTTONS onto
+     their own line; as loose flex items the text was squeezed to a word a line
+     and the buttons ran out past the card edge. */
+  .expnote .say{flex:1 1 11em;min-width:0}
+  .expnote .acts{display:flex;gap:6px;margin-left:auto;flex:none}
   /* sign-in while refresh is still the first thing to try: same shape, no tint */
   .expnote .relog.quiet{border-color:var(--line-2);background:transparent;color:var(--fg-2)}
   .hero .expnote{font-size:12px;margin-bottom:14px;padding:8px 11px}
@@ -1305,7 +1309,8 @@
     const relog = ADD_LIVE.includes(ADD.state) ? ""
       : `<button class="relog${dead ? "" : " quiet"}" data-relog="${n}"><span class="ms">login</span
           >Sign in again</button>`;
-    return `<div class="expnote"><span class="ms">key_off</span>${say}${renew}${relog}</div>`;
+    return `<div class="expnote"><span class="ms">key_off</span><span class="say">${say}</span
+      ><span class="acts">${renew}${relog}</span></div>`;
   }
 
   /* The active account is the one you never have to name — `claude` alone runs
