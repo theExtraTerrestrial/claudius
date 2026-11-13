@@ -651,7 +651,7 @@ oauth["scopes"] = body["scope"].split(" ") if body["scope"] && !body["scope"].to
 data["claudeAiOauth"] = oauth
 
 begin
-  tmp = path + ".tmp"
+  tmp = path + ".#{$$}.tmp"
   File.write(tmp, JSON.generate(data))
   File.chmod(0o600, tmp)
   File.rename(tmp, path)
@@ -970,7 +970,7 @@ if ver && !ver.empty? && data["lastOnboardingVersion"] != ver
   changed = true
 end
 if changed
-  tmp = path + ".tmp"
+  tmp = path + ".#{$$}.tmp"
   File.write(tmp, JSON.generate(data))
   File.rename(tmp, path)
   File.chmod(0o600, path)
@@ -1370,7 +1370,7 @@ bak = prof + '.claudius-bak'
 begin
   require 'fileutils'
   FileUtils.cp(prof, bak) if File.file?(prof) && !File.exist?(bak)
-  tmp = prof + '.tmp'
+  tmp = prof + ".#{$$}.tmp"
   File.write(tmp, JSON.pretty_generate(p))
   File.chmod(0o600, tmp)
   File.rename(tmp, prof)
@@ -1415,7 +1415,7 @@ end
 exit 0 unless changed
 d['projects'] = dp
 begin
-  tmp = prof + '.tmp'
+  tmp = prof + ".#{$$}.tmp"
   File.write(tmp, JSON.generate(d))
   File.chmod(0o600, tmp)
   File.rename(tmp, prof)
@@ -2393,7 +2393,7 @@ names.each do |name|
     kept = thin(rows, now)
     if kept.length < rows.length
       begin
-        tmp = path + '.tmp'
+        tmp = path + ".#{$$}.tmp"
         File.open(tmp, 'w') do |f|
           kept.each do |r|
             f.write("#{r[0]} #{r[1] || '-'} #{r[2] || '-'} #{r[3] || '-'} #{r[4] || '-'}\n")
