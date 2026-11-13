@@ -878,6 +878,8 @@ list_profiles() {
   for d in "$PROFILE_ROOT"/*/; do
     [[ -d "$d" ]] || continue
     d="${d%/}"
+    # Claude Code drops a `<profile>.lock` dir beside each config dir it locks.
+    [[ "$d" == *.lock ]] && continue
     printf '%s\n' "${d##*/}"
   done | sort
 }
@@ -2215,7 +2217,7 @@ rescue
 end
 out = []
 (Dir.exist?(root) ? Dir.children(root) : []).sort.each do |name|
-  next if name.start_with?('.')
+  next if name.start_with?('.') || name.end_with?('.lock')
   dir = File.join(root, name)
   next unless File.directory?(dir)
   email = org = sub = ""
@@ -2381,7 +2383,7 @@ names = Dir.exist?(root) ? Dir.children(root).sort : []
 names = names.select { |n| n == only } unless only.empty?
 out = []
 names.each do |name|
-  next if name.start_with?('.')
+  next if name.start_with?('.') || name.end_with?('.lock')
   dir = File.join(root, name)
   next unless File.directory?(dir)
   path = File.join(dir, '.usage.log')
